@@ -1,0 +1,16 @@
+{
+  "name": "gigprofit-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.104.0",
+    "plaid": "^30.0.0"
+  }
+}
