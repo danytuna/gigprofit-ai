@@ -1,82 +1,45 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import OpenAI from "openai";
-
-dotenv.config();
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-
-// TEST ROUTE
 app.get("/", (req, res) => {
-  res.send("GigProfit backend running 🚀");
+  res.send("GigProfit AI backend running");
 });
 
-
-// AI CHAT ENDPOINT
-app.post("/ai/chat", async (req, res) => {
+app.post("/ask", async (req, res) => {
   try {
+    const { prompt } = req.body;
 
-    const { message } = req.body;
+    if (!prompt) {
+      return res.status(400).json({ error: "Missing prompt" });
+    }
 
-    const prompt = `
-You are GigProfit AI.
-
-You help gig workers in the United States maximize profits while driving for apps like:
-Uber
-Lyft
-Uber Eats
-DoorDash
-Instacart
-
-Give practical advice about:
-
-• best times to drive
-• good vs bad orders
-• strategies for maximizing profit
-• avoiding low-paying trips
-• driving demand patterns
-
-Keep responses clear and helpful.
-
-User question:
-${message}
-`;
-
-    const response = await openai.responses.create({
-      model: "gpt-5-mini",
-      input: prompt
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "user", content: prompt }
+      ],
     });
 
-    const reply = response.output_text;
-
-    res.json({
-      reply: reply
-    });
-
+    const text = response.choices?.[0]?.message?.content ?? "No response";
+    res.json({ reply: text });
   } catch (error) {
-
-    console.error("OpenAI error:", error);
-
-    res.status(500).json({
-      reply: "AI temporarily unavailable."
-    });
-
+    console.error("ASK ERROR:", error);
+    res.status(500).json({ error: "AI request failed" });
   }
 });
 
-
-// START SERVER
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`🚀 GigProfit backend running on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`GigProfit backend listening on port ${PORT}`);
 });
