@@ -11,6 +11,50 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
+const PLAID_SECRET = process.env.PLAID_SECRET;
+const PLAID_ENV = process.env.PLAID_ENV || "sandbox";
+const PLAID_PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const PLAID_COUNTRY_CODES = (process.env.PLAID_COUNTRY_CODES || "US")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function plaidBaseUrl() {
+  switch (PLAID_ENV) {
+    case "production":
+      return "https://production.plaid.com";
+    case "development":
+      return "https://development.plaid.com";
+    case "sandbox":
+    default:
+      return "https://sandbox.plaid.com";
+  }
+}
+
+async function plaidRequest(path, body) {
+  const response = await fetch(`${plaidBaseUrl()}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "PLAID-CLIENT-ID": PLAID_CLIENT_ID,
+      "PLAID-SECRET": PLAID_SECRET,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error_message || `Plaid request failed: ${response.status}`);
+  }
+
+  return data;
+}
+
 const CITY_CENTERS = {
   Charlotte: { lat: 35.2271, lon: -80.8431 },
   Atlanta: { lat: 33.7490, lon: -84.3880 },
@@ -165,9 +209,7 @@ function estimateDriveMinutes(miles) {
 async function getTrafficDriveMinutes(originLon, originLat, destLon, destLat) {
   const token = process.env.MAPBOX_ACCESS_TOKEN;
 
-  if (!token) {
-    return null;
-  }
+  if (!token) return null;
 
   const url =
     `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/` +
@@ -183,9 +225,7 @@ async function getTrafficDriveMinutes(originLon, originLat, destLon, destLat) {
   const data = await response.json();
   const route = data?.routes?.[0];
 
-  if (!route?.duration) {
-    return null;
-  }
+  if (!route?.duration) return null;
 
   return Math.max(1, Math.round(route.duration / 60));
 }
@@ -209,27 +249,26 @@ app.post("/ask", async (req, res) => {
         {
           role: "system",
           content: `
-You are GigProfit AI, a smart assistant for Uber, Lyft, and delivery drivers.
+You are GigProfit AI, a smart copilot for Uber and Lyft drivers.
 
 Your job:
-- analyze offers fast
-- help drivers decide if an order is worth taking
+- analyze ride offers fast
+- help drivers decide if a trip is worth taking
 - speak in plain, practical English
 - be concise
 - never use LaTeX, formulas, markdown tables, or academic explanations
-- never sound like a math tutor
 
 When the user gives pay, miles, or time:
 1. calculate dollars per mile
 2. if time is given, calculate estimated dollars per hour
 3. give a verdict first:
-   - GOOD ORDER
+   - GOOD RIDE
    - MAYBE
-   - BAD ORDER
+   - BAD RIDE
 
 Preferred format:
 
-Verdict: GOOD ORDER / MAYBE / BAD ORDER
+Verdict: GOOD RIDE / MAYBE / BAD RIDE
 
 $/mile: X.XX
 $/hour: X.XX (if possible)
@@ -241,10 +280,7 @@ Recommendation:
 Accept / Maybe / Decline
           `.trim(),
         },
-        {
-          role: "user",
-          content: prompt,
-        },
+        { role: "user", content: prompt },
       ],
     });
 
@@ -272,12 +308,9 @@ app.post("/radar/recommend", async (req, res) => {
         : new Date().getHours();
 
     const cityZones = getCityZones(city);
-
     const cityCenter = CITY_CENTERS[city] || CITY_CENTERS["Charlotte"];
-    const baseLat =
-      typeof latitude === "number" ? latitude : cityCenter.lat;
-    const baseLon =
-      typeof longitude === "number" ? longitude : cityCenter.lon;
+    const baseLat = typeof latitude === "number" ? latitude : cityCenter.lat;
+    const baseLon = typeof longitude === "number" ? longitude : cityCenter.lon;
 
     const scoredZones = await Promise.all(
       cityZones.map(async (zone) => {
@@ -317,10 +350,8 @@ app.post("/radar/recommend", async (req, res) => {
 
     scoredZones.sort((a, b) => b.finalScore - a.finalScore);
 
-    const bestZone = scoredZones[0];
-
     const aiPrompt = `
-You are GigProfit Radar AI.
+You are GigProfit Radar AI for Uber and Lyft drivers.
 
 User city: ${city}
 Mode: ${mode}
@@ -369,12 +400,9 @@ Recommendation:
         {
           role: "system",
           content:
-            "You are a concise radar copilot for gig drivers. Be direct and practical.",
+            "You are a concise radar copilot for Uber and Lyft drivers. Be direct and practical.",
         },
-        {
-          role: "user",
-          content: aiPrompt,
-        },
+        { role: "user", content: aiPrompt },
       ],
     });
 
@@ -385,13 +413,71 @@ Recommendation:
       city,
       mode,
       hour: resolvedHour,
-      bestZone,
+      bestZone: scoredZones[0],
       zones: scoredZones,
       explanation,
     });
   } catch (error) {
     console.error("RADAR ERROR:", error);
     res.status(500).json({ error: "Radar recommendation failed" });
+  }
+});
+
+// PLAID: create link token
+app.post("/plaid/create_link_token", async (req, res) => {
+  try {
+    if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      return res.status(500).json({ error: "Plaid is not configured on the server." });
+    }
+
+    const { userId = `gigprofit-user-${Date.now()}` } = req.body || {};
+
+    const response = await plaidRequest("/link/token/create", {
+      user: {
+        client_user_id: String(userId),
+      },
+      client_name: "GigProfit",
+      products: PLAID_PRODUCTS,
+      country_codes: PLAID_COUNTRY_CODES,
+      language: "en",
+    });
+
+    res.json({
+      link_token: response.link_token,
+      expiration: response.expiration,
+      request_id: response.request_id,
+    });
+  } catch (error) {
+    console.error("PLAID CREATE LINK TOKEN ERROR:", error);
+    res.status(500).json({ error: error.message || "Failed to create link token." });
+  }
+});
+
+// PLAID: exchange public token
+app.post("/plaid/exchange_public_token", async (req, res) => {
+  try {
+    if (!PLAID_CLIENT_ID || !PLAID_SECRET) {
+      return res.status(500).json({ error: "Plaid is not configured on the server." });
+    }
+
+    const { public_token } = req.body || {};
+
+    if (!public_token) {
+      return res.status(400).json({ error: "Missing public_token." });
+    }
+
+    const response = await plaidRequest("/item/public_token/exchange", {
+      public_token,
+    });
+
+    res.json({
+      access_token: response.access_token,
+      item_id: response.item_id,
+      request_id: response.request_id,
+    });
+  } catch (error) {
+    console.error("PLAID EXCHANGE TOKEN ERROR:", error);
+    res.status(500).json({ error: error.message || "Failed to exchange public token." });
   }
 });
 
