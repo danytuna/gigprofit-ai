@@ -116,6 +116,21 @@ function timeBonus(type, hour) {
   }
 }
 
+function trafficPenaltyFromMinutes(minutes) {
+  if (minutes <= 8) return 0;
+  if (minutes <= 15) return 3;
+  if (minutes <= 22) return 7;
+  if (minutes <= 30) return 12;
+  return 18;
+}
+
+function trafficLevel(minutes) {
+  if (minutes <= 8) return "light";
+  if (minutes <= 15) return "moderate";
+  if (minutes <= 25) return "busy";
+  return "heavy";
+}
+
 function toRadians(value) {
   return (value * Math.PI) / 180;
 }
@@ -145,6 +160,34 @@ function distancePenalty(miles) {
 
 function estimateDriveMinutes(miles) {
   return Math.max(1, Math.round((miles / 25) * 60));
+}
+
+async function getTrafficDriveMinutes(originLon, originLat, destLon, destLat) {
+  const token = process.env.MAPBOX_ACCESS_TOKEN;
+
+  if (!token) {
+    return null;
+  }
+
+  const url =
+    `https://api.mapbox.com/directions/v5/mapbox/driving-traffic/` +
+    `${originLon},${originLat};${destLon},${destLat}` +
+    `?alternatives=false&geometries=geojson&overview=simplified&steps=false&access_token=${token}`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Mapbox traffic request failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const route = data?.routes?.[0];
+
+  if (!route?.duration) {
+    return null;
+  }
+
+  return Math.max(1, Math.round(route.duration / 60));
 }
 
 app.get("/", (req, res) => {
@@ -236,24 +279,43 @@ app.post("/radar/recommend", async (req, res) => {
     const baseLon =
       typeof longitude === "number" ? longitude : cityCenter.lon;
 
-    const scoredZones = cityZones
-      .map((zone) => {
+    const scoredZones = await Promise.all(
+      cityZones.map(async (zone) => {
         const miles = distanceMiles(baseLat, baseLon, zone.lat, zone.lon);
-        const driveMinutes = estimateDriveMinutes(miles);
+
+        let driveMinutes = estimateDriveMinutes(miles);
+        let liveTraffic = false;
+
+        try {
+          const liveMinutes = await getTrafficDriveMinutes(baseLon, baseLat, zone.lon, zone.lat);
+          if (typeof liveMinutes === "number") {
+            driveMinutes = liveMinutes;
+            liveTraffic = true;
+          }
+        } catch (trafficError) {
+          console.error("TRAFFIC ERROR:", trafficError.message);
+        }
 
         const finalScore = Math.max(
           1,
-          zone.baseScore + timeBonus(zone.type, resolvedHour) - distancePenalty(miles)
+          zone.baseScore +
+            timeBonus(zone.type, resolvedHour) -
+            distancePenalty(miles) -
+            trafficPenaltyFromMinutes(driveMinutes)
         );
 
         return {
           ...zone,
           distanceMiles: Number(miles.toFixed(1)),
           driveMinutes,
+          trafficLevel: trafficLevel(driveMinutes),
+          liveTraffic,
           finalScore,
         };
       })
-      .sort((a, b) => b.finalScore - a.finalScore);
+    );
+
+    scoredZones.sort((a, b) => b.finalScore - a.finalScore);
 
     const bestZone = scoredZones[0];
 
@@ -274,6 +336,7 @@ type: ${z.type}
 score: ${z.finalScore}
 distance: ${z.distanceMiles} miles
 drive time: ${z.driveMinutes} min
+traffic level: ${z.trafficLevel}
 expected earnings: ${z.expected}
 description: ${z.description}
 `
@@ -288,6 +351,9 @@ Best move now: <zone>
 
 Why:
 <1-2 short lines>
+
+Traffic:
+<light / moderate / busy / heavy>
 
 Expected:
 <earnings>
