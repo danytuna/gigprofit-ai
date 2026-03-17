@@ -11,6 +11,46 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+async function getNearbyEvents(city) {
+  const apiKey = process.env.TICKETMASTER_API_KEY;
+
+  if (!apiKey) return [];
+
+  try {
+    const url =
+      `https://app.ticketmaster.com/discovery/v2/events.json` +
+      `?apikey=${apiKey}` +
+      `&city=${encodeURIComponent(city)}` +
+      `&size=8` +
+      `&sort=date,asc`;
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`Ticketmaster request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const events = data?._embedded?.events || [];
+
+    return events.map((event) => {
+      const venue = event?._embedded?.venues?.[0];
+
+      return {
+        name: event?.name || "Unknown Event",
+        venue: venue?.name || "Unknown Venue",
+        lat: venue?.location?.latitude ? parseFloat(venue.location.latitude) : null,
+        lon: venue?.location?.longitude ? parseFloat(venue.location.longitude) : null,
+        date: event?.dates?.start?.localDate || null,
+        time: event?.dates?.start?.localTime || null
+      };
+    });
+  } catch (error) {
+    console.error("TICKETMASTER ERROR:", error.message);
+    return [];
+  }
+}
+
 function getCityZones(city) {
   const zoneMap = {
     Charlotte: [
@@ -952,6 +992,23 @@ async function getTrafficDriveMinutes(originLon, originLat, destLon, destLat) {
   return Math.max(1, Math.round(route.duration / 60));
 }
 
+function formatEventSummary(events) {
+  if (!events.length) return "No major events detected";
+
+  return events
+    .slice(0, 5)
+    .map((event) => {
+      const parts = [event.name];
+
+      if (event.venue) parts.push(`at ${event.venue}`);
+      if (event.date) parts.push(`on ${event.date}`);
+      if (event.time) parts.push(`at ${event.time}`);
+
+      return parts.join(" ");
+    })
+    .join("\n");
+}
+
 app.get("/", (req, res) => {
   res.send("GigProfit AI backend running");
 });
@@ -1019,6 +1076,7 @@ app.post("/radar/recommend", async (req, res) => {
         : new Date().getHours();
 
     const cityZones = getCityZones(city);
+    const events = await getNearbyEvents(city);
 
     let referenceLat = cityZones[0]?.lat ?? 35.2271;
     let referenceLon = cityZones[0]?.lon ?? -80.8431;
@@ -1051,10 +1109,28 @@ app.post("/radar/recommend", async (req, res) => {
           console.error("TRAFFIC ERROR:", trafficError.message);
         }
 
+        let eventBoost = 0;
+        const nearbyEvents = [];
+
+        for (const event of events) {
+          if (typeof event.lat !== "number" || typeof event.lon !== "number") continue;
+
+          const eventDistance = distanceMiles(zone.lat, zone.lon, event.lat, event.lon);
+
+          if (eventDistance < 2) {
+            eventBoost += 12;
+            nearbyEvents.push(event.name);
+          } else if (eventDistance < 5) {
+            eventBoost += 6;
+            nearbyEvents.push(event.name);
+          }
+        }
+
         const finalScore = Math.max(
           1,
           zone.baseScore +
-            timeBonus(zone.type, resolvedHour) -
+            timeBonus(zone.type, resolvedHour) +
+            eventBoost -
             distancePenalty(miles) -
             trafficPenaltyFromMinutes(driveMinutes)
         );
@@ -1066,6 +1142,8 @@ app.post("/radar/recommend", async (req, res) => {
           trafficLevel: trafficLevel(driveMinutes),
           liveTraffic,
           finalScore,
+          eventBoost,
+          nearbyEvents: Array.from(new Set(nearbyEvents)).slice(0, 3)
         };
       })
     );
@@ -1078,6 +1156,9 @@ You are GigProfit Radar AI for Uber and Lyft drivers.
 User city: ${city}
 Mode: ${mode}
 Current hour: ${resolvedHour}
+
+Live events nearby:
+${formatEventSummary(events)}
 
 Top candidate zones:
 ${scoredZones
@@ -1092,6 +1173,8 @@ drive time: ${z.driveMinutes} min
 traffic level: ${z.trafficLevel}
 expected earnings: ${z.expected}
 description: ${z.description}
+event boost: ${z.eventBoost}
+nearby events: ${z.nearbyEvents.length ? z.nearbyEvents.join(", ") : "none"}
 `
   )
   .join("\n")}
@@ -1138,6 +1221,7 @@ Recommendation:
       bestZone: scoredZones[0],
       zones: scoredZones,
       explanation,
+      events: events.slice(0, 5)
     });
   } catch (error) {
     console.error("RADAR ERROR:", error);
