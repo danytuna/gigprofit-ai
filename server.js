@@ -94,62 +94,106 @@ function buildDynamicExpected({
   let source = "base";
   let sampleCount = 0;
 
-  if (community.zoneAvgHourly && community.zoneCount >= 2) {
+  // ----------------------------------
+  // COMMUNITY DATA
+  // ----------------------------------
+
+  if (community.zoneAvgHourly && community.zoneCount >= 3) {
     center = community.zoneAvgHourly;
     source = "zone";
     sampleCount = community.zoneCount;
-  } else if (community.cityAvgHourly && community.cityCount >= 4) {
+  } else if (community.cityAvgHourly && community.cityCount >= 6) {
     center = community.cityAvgHourly;
     source = "city";
     sampleCount = community.cityCount;
   } else if (community.zoneAvgHourly) {
-    center = baseMid * 0.45 + community.zoneAvgHourly * 0.55;
+    center = baseMid * 0.5 + community.zoneAvgHourly * 0.5;
     source = "blended-zone";
     sampleCount = community.zoneCount;
   } else if (community.cityAvgHourly) {
-    center = baseMid * 0.65 + community.cityAvgHourly * 0.35;
+    center = baseMid * 0.7 + community.cityAvgHourly * 0.3;
     source = "blended-city";
     sampleCount = community.cityCount;
   }
 
-  // traffic adjustment
+  // ----------------------------------
+  // TRAFFIC IMPACT
+  // ----------------------------------
+
   switch (trafficLevelValue) {
     case "light":
-      center *= 1.05;
+      center *= 1.03;
       break;
     case "moderate":
-      center *= 1.0;
+      center *= 0.98;
       break;
     case "busy":
-      center *= 0.93;
+      center *= 0.90;
       break;
     case "heavy":
-      center *= 0.85;
+      center *= 0.80;
       break;
     default:
       center *= 1.0;
   }
 
-  // time-of-day bonus
-  center *= 1 + Math.min(timeBonusPoints * 0.006, 0.10);
+  // ----------------------------------
+  // TIME BONUS (small)
+  // ----------------------------------
 
-  // event lift
-  center += Math.min(eventBoost * 0.35, 6);
+  center *= 1 + Math.min(timeBonusPoints * 0.004, 0.06);
 
-  center = clamp(center, 12, 80);
+  // ----------------------------------
+  // EVENT BOOST (controlled)
+  // ----------------------------------
 
-  let spread = 0.22;
+  center += Math.min(eventBoost * 0.2, 4);
+
+  // ----------------------------------
+  // REALITY CHECK
+  // ----------------------------------
+
+  const lowData =
+    (community.zoneCount || 0) < 3 &&
+    (community.cityCount || 0) < 6;
+
+  if (lowData) {
+    center *= 0.75;
+  }
+
+  // ----------------------------------
+  // BUSY BUT NOT PAYING
+  // ----------------------------------
+
+  if (
+    (trafficLevelValue === "busy" || trafficLevelValue === "heavy") &&
+    lowData
+  ) {
+    center *= 0.85;
+  }
+
+  // ----------------------------------
+  // HARD CAP if low data
+  // ----------------------------------
+
+  if (center > 32 && lowData) {
+    center = 32;
+  }
+
+  center = clamp(center, 12, 60);
+
+  let spread = 0.25;
 
   if (sampleCount >= 10) {
     spread = 0.12;
   } else if (sampleCount >= 5) {
     spread = 0.16;
-  } else if (sampleCount >= 2) {
-    spread = 0.19;
+  } else if (sampleCount >= 3) {
+    spread = 0.20;
   }
 
-  const low = clamp(center * (1 - spread / 2), 10, 75);
-  const high = clamp(center * (1 + spread / 2), 12, 85);
+  const low = clamp(center * (1 - spread / 2), 10, 55);
+  const high = clamp(center * (1 + spread / 2), 12, 65);
 
   return {
     expected: `$${Math.round(low)}-$${Math.round(high)}/hr`,
@@ -225,7 +269,7 @@ function getCityZones(city) {
         city: "Charlotte",
         name: "South End",
         type: "nightlife",
-        lat: 35.213,
+        lat: 35.2130,
         lon: -80.8576,
         baseScore: 88,
         expected: "$28-$40/hr",
@@ -269,7 +313,7 @@ function getCityZones(city) {
         name: "Midtown",
         type: "downtown",
         lat: 33.7815,
-        lon: -84.388,
+        lon: -84.3880,
         baseScore: 85,
         expected: "$24-$36/hr",
         description: "Dense offices, hotels, nightlife, and event demand throughout the day.",
@@ -288,8 +332,8 @@ function getCityZones(city) {
         city: "Atlanta",
         name: "Downtown Atlanta",
         type: "downtown",
-        lat: 33.749,
-        lon: -84.388,
+        lat: 33.7490,
+        lon: -84.3880,
         baseScore: 82,
         expected: "$22-$34/hr",
         description: "Convention, hotel, commuter, and stadium-driven ride activity.",
@@ -342,7 +386,7 @@ function getCityZones(city) {
         name: "Wynwood",
         type: "nightlife",
         lat: 25.8005,
-        lon: -80.199,
+        lon: -80.1990,
         baseScore: 84,
         expected: "$26-$38/hr",
         description: "Restaurants, bars, and event activity make this a strong evening zone.",
@@ -352,7 +396,7 @@ function getCityZones(city) {
         name: "MIA Airport",
         type: "airport",
         lat: 25.7959,
-        lon: -80.287,
+        lon: -80.2870,
         baseScore: 82,
         expected: "$22-$36/hr",
         description: "Airport demand can be strong, especially during travel rush windows.",
@@ -534,7 +578,7 @@ function getCityZones(city) {
         name: "Downtown Dallas",
         type: "downtown",
         lat: 32.7767,
-        lon: -96.797,
+        lon: -96.7970,
         baseScore: 83,
         expected: "$22-$34/hr",
         description: "Central business and hotel demand with event support.",
@@ -627,7 +671,7 @@ function getCityZones(city) {
         name: "Rice Village",
         type: "university",
         lat: 29.7153,
-        lon: -95.414,
+        lon: -95.4140,
         baseScore: 68,
         expected: "$18-$28/hr",
         description: "Good local demand near campus, shopping, and dining.",
@@ -703,7 +747,7 @@ function getCityZones(city) {
         name: "River North",
         type: "nightlife",
         lat: 41.8924,
-        lon: -87.634,
+        lon: -87.6340,
         baseScore: 88,
         expected: "$28-$41/hr",
         description: "One of Chicago’s strongest nightlife and restaurant zones.",
@@ -746,7 +790,7 @@ function getCityZones(city) {
         name: "Midtown Manhattan",
         type: "downtown",
         lat: 40.7549,
-        lon: -73.984,
+        lon: -73.9840,
         baseScore: 90,
         expected: "$28-$42/hr",
         description: "Dense hotel, business, tourist, and event activity all day.",
@@ -755,7 +799,7 @@ function getCityZones(city) {
         city: "New York",
         name: "Times Square",
         type: "nightlife",
-        lat: 40.758,
+        lat: 40.7580,
         lon: -73.9855,
         baseScore: 89,
         expected: "$30-$44/hr",
@@ -765,7 +809,7 @@ function getCityZones(city) {
         city: "New York",
         name: "Lower Manhattan",
         type: "downtown",
-        lat: 40.706,
+        lat: 40.7060,
         lon: -74.0086,
         baseScore: 84,
         expected: "$24-$36/hr",
@@ -852,7 +896,7 @@ function getCityZones(city) {
         name: "Downtown Phoenix",
         type: "downtown",
         lat: 33.4484,
-        lon: -112.074,
+        lon: -112.0740,
         baseScore: 81,
         expected: "$22-$33/hr",
         description: "Central business and event activity keep rides flowing.",
@@ -872,7 +916,7 @@ function getCityZones(city) {
         name: "Tempe",
         type: "university",
         lat: 33.4255,
-        lon: -111.94,
+        lon: -111.9400,
         baseScore: 76,
         expected: "$20-$31/hr",
         description: "Student life, bars, and local activity support ride demand.",
@@ -914,7 +958,7 @@ function getCityZones(city) {
         city: "Las Vegas",
         name: "Fremont Street",
         type: "nightlife",
-        lat: 36.17,
+        lat: 36.1700,
         lon: -115.1447,
         baseScore: 88,
         expected: "$28-$42/hr",
@@ -924,7 +968,7 @@ function getCityZones(city) {
         city: "Las Vegas",
         name: "Harry Reid Airport",
         type: "airport",
-        lat: 36.084,
+        lat: 36.0840,
         lon: -115.1537,
         baseScore: 86,
         expected: "$24-$38/hr",
@@ -945,7 +989,7 @@ function getCityZones(city) {
         name: "Summerlin",
         type: "shopping",
         lat: 36.1699,
-        lon: -115.291,
+        lon: -115.2910,
         baseScore: 65,
         expected: "$17-$27/hr",
         description: "More residential and spread out, but can support local rides.",
@@ -988,7 +1032,7 @@ function getCityZones(city) {
         name: "SFO Airport",
         type: "airport",
         lat: 37.6213,
-        lon: -122.379,
+        lon: -122.3790,
         baseScore: 85,
         expected: "$24-$37/hr",
         description: "Airport rides can be strong during heavy travel windows.",
@@ -1063,7 +1107,7 @@ function getCityZones(city) {
 }
 
 // --------------------------------------------------
-// RADAR UTILS
+// RADAR HELPERS
 // --------------------------------------------------
 
 function timeBonus(type, hour) {
@@ -1243,7 +1287,7 @@ app.post("/ask", async (req, res) => {
 
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.35,
+      temperature: 0.4,
       messages: [
         {
           role: "system",
@@ -1368,12 +1412,14 @@ app.post("/radar/recommend", async (req, res) => {
         );
 
         return {
-          ...zone,
+          city: zone.city,
+          name: zone.name,
+          type: zone.type,
+          lat: zone.lat,
+          lon: zone.lon,
+          baseScore: zone.baseScore,
           expected: dynamicExpected.expected,
-          expectedLow: dynamicExpected.expectedLow,
-          expectedHigh: dynamicExpected.expectedHigh,
-          expectedSource: dynamicExpected.expectedSource,
-          expectedSampleCount: dynamicExpected.expectedSampleCount,
+          description: zone.description,
           distanceMiles: Number(miles.toFixed(1)),
           driveMinutes,
           trafficLevel: level,
@@ -1381,6 +1427,10 @@ app.post("/radar/recommend", async (req, res) => {
           finalScore,
           eventBoost,
           nearbyEvents: Array.from(new Set(nearbyEvents)).slice(0, 3),
+          expectedLow: dynamicExpected.expectedLow,
+          expectedHigh: dynamicExpected.expectedHigh,
+          expectedSource: dynamicExpected.expectedSource,
+          expectedSampleCount: dynamicExpected.expectedSampleCount,
           communityZoneCount: community.zoneCount,
           communityCityCount: community.cityCount,
           communityZoneAvgHourly: community.zoneAvgHourly,
