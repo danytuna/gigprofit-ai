@@ -11,6 +11,159 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// --------------------------------------------------
+// COMMUNITY REPORTS (memory-only v1)
+// --------------------------------------------------
+
+const COMMUNITY_REPORT_TTL_MS = 1000 * 60 * 60 * 4; // 4 hours
+const communityReports = [];
+
+function cleanupCommunityReports() {
+  const cutoff = Date.now() - COMMUNITY_REPORT_TTL_MS;
+
+  for (let i = communityReports.length - 1; i >= 0; i -= 1) {
+    if (communityReports[i].createdAt < cutoff) {
+      communityReports.splice(i, 1);
+    }
+  }
+}
+
+function normalizeKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function average(values) {
+  if (!values.length) return null;
+  return values.reduce((sum, n) => sum + n, 0) / values.length;
+}
+
+function parseExpectedMidpoint(text) {
+  const nums = String(text || "").match(/\d+/g);
+
+  if (!nums || !nums.length) return 24;
+
+  const parsed = nums.map(Number).filter((n) => !Number.isNaN(n));
+
+  if (parsed.length >= 2) {
+    return (parsed[0] + parsed[1]) / 2;
+  }
+
+  return parsed[0] || 24;
+}
+
+function getCommunitySnapshot(city, zoneName) {
+  cleanupCommunityReports();
+
+  const cityKey = normalizeKey(city);
+  const zoneKey = normalizeKey(zoneName);
+
+  const cityReports = communityReports.filter(
+    (report) => normalizeKey(report.city) === cityKey
+  );
+
+  const zoneReports = cityReports.filter(
+    (report) => normalizeKey(report.zone) === zoneKey
+  );
+
+  return {
+    cityCount: cityReports.length,
+    zoneCount: zoneReports.length,
+    cityAvgHourly: average(cityReports.map((r) => r.hourlyRate)),
+    zoneAvgHourly: average(zoneReports.map((r) => r.hourlyRate)),
+    cityAvgPerMile: average(cityReports.map((r) => r.dollarsPerMile)),
+    zoneAvgPerMile: average(zoneReports.map((r) => r.dollarsPerMile)),
+  };
+}
+
+function buildDynamicExpected({
+  baseExpectedText,
+  trafficLevelValue,
+  timeBonusPoints,
+  eventBoost,
+  community,
+}) {
+  const baseMid = parseExpectedMidpoint(baseExpectedText);
+
+  let center = baseMid;
+  let source = "base";
+  let sampleCount = 0;
+
+  if (community.zoneAvgHourly && community.zoneCount >= 2) {
+    center = community.zoneAvgHourly;
+    source = "zone";
+    sampleCount = community.zoneCount;
+  } else if (community.cityAvgHourly && community.cityCount >= 4) {
+    center = community.cityAvgHourly;
+    source = "city";
+    sampleCount = community.cityCount;
+  } else if (community.zoneAvgHourly) {
+    center = baseMid * 0.45 + community.zoneAvgHourly * 0.55;
+    source = "blended-zone";
+    sampleCount = community.zoneCount;
+  } else if (community.cityAvgHourly) {
+    center = baseMid * 0.65 + community.cityAvgHourly * 0.35;
+    source = "blended-city";
+    sampleCount = community.cityCount;
+  }
+
+  // traffic adjustment
+  switch (trafficLevelValue) {
+    case "light":
+      center *= 1.05;
+      break;
+    case "moderate":
+      center *= 1.0;
+      break;
+    case "busy":
+      center *= 0.93;
+      break;
+    case "heavy":
+      center *= 0.85;
+      break;
+    default:
+      center *= 1.0;
+  }
+
+  // time-of-day bonus
+  center *= 1 + Math.min(timeBonusPoints * 0.006, 0.10);
+
+  // event lift
+  center += Math.min(eventBoost * 0.35, 6);
+
+  center = clamp(center, 12, 80);
+
+  let spread = 0.22;
+
+  if (sampleCount >= 10) {
+    spread = 0.12;
+  } else if (sampleCount >= 5) {
+    spread = 0.16;
+  } else if (sampleCount >= 2) {
+    spread = 0.19;
+  }
+
+  const low = clamp(center * (1 - spread / 2), 10, 75);
+  const high = clamp(center * (1 + spread / 2), 12, 85);
+
+  return {
+    expected: `$${Math.round(low)}-$${Math.round(high)}/hr`,
+    expectedLow: Number(low.toFixed(1)),
+    expectedHigh: Number(high.toFixed(1)),
+    expectedSource: source,
+    expectedSampleCount: sampleCount,
+  };
+}
+
+// --------------------------------------------------
+// TICKETMASTER
+// --------------------------------------------------
+
 async function getNearbyEvents(city) {
   const apiKey = process.env.TICKETMASTER_API_KEY;
 
@@ -42,7 +195,7 @@ async function getNearbyEvents(city) {
         lat: venue?.location?.latitude ? parseFloat(venue.location.latitude) : null,
         lon: venue?.location?.longitude ? parseFloat(venue.location.longitude) : null,
         date: event?.dates?.start?.localDate || null,
-        time: event?.dates?.start?.localTime || null
+        time: event?.dates?.start?.localTime || null,
       };
     });
   } catch (error) {
@@ -50,6 +203,10 @@ async function getNearbyEvents(city) {
     return [];
   }
 }
+
+// --------------------------------------------------
+// CITY ZONES
+// --------------------------------------------------
 
 function getCityZones(city) {
   const zoneMap = {
@@ -61,18 +218,18 @@ function getCityZones(city) {
         lat: 35.2271,
         lon: -80.8431,
         baseScore: 84,
-        expected: "$24–$36/hr",
-        description: "Strong business, hotel, commuter, and event traffic in central Charlotte."
+        expected: "$24-$36/hr",
+        description: "Strong business, hotel, commuter, and event traffic in central Charlotte.",
       },
       {
         city: "Charlotte",
         name: "South End",
         type: "nightlife",
-        lat: 35.2130,
+        lat: 35.213,
         lon: -80.8576,
         baseScore: 88,
-        expected: "$28–$40/hr",
-        description: "One of the best nightlife and restaurant zones in Charlotte, especially evenings."
+        expected: "$28-$40/hr",
+        description: "One of the best nightlife and restaurant zones in Charlotte, especially evenings.",
       },
       {
         city: "Charlotte",
@@ -81,8 +238,8 @@ function getCityZones(city) {
         lat: 35.2479,
         lon: -80.8057,
         baseScore: 78,
-        expected: "$22–$34/hr",
-        description: "Popular arts and bar district with solid evening and weekend demand."
+        expected: "$22-$34/hr",
+        description: "Popular arts and bar district with solid evening and weekend demand.",
       },
       {
         city: "Charlotte",
@@ -91,8 +248,8 @@ function getCityZones(city) {
         lat: 35.2144,
         lon: -80.9473,
         baseScore: 80,
-        expected: "$22–$35/hr",
-        description: "Strong airport demand during travel peaks and useful for longer rides."
+        expected: "$22-$35/hr",
+        description: "Strong airport demand during travel peaks and useful for longer rides.",
       },
       {
         city: "Charlotte",
@@ -101,9 +258,9 @@ function getCityZones(city) {
         lat: 35.3071,
         lon: -80.7359,
         baseScore: 70,
-        expected: "$18–$28/hr",
-        description: "Student and campus traffic can create short-trip demand during active hours."
-      }
+        expected: "$18-$28/hr",
+        description: "Student and campus traffic can create short-trip demand during active hours.",
+      },
     ],
 
     Atlanta: [
@@ -112,10 +269,10 @@ function getCityZones(city) {
         name: "Midtown",
         type: "downtown",
         lat: 33.7815,
-        lon: -84.3880,
+        lon: -84.388,
         baseScore: 85,
-        expected: "$24–$36/hr",
-        description: "Dense offices, hotels, nightlife, and event demand throughout the day."
+        expected: "$24-$36/hr",
+        description: "Dense offices, hotels, nightlife, and event demand throughout the day.",
       },
       {
         city: "Atlanta",
@@ -124,18 +281,18 @@ function getCityZones(city) {
         lat: 33.8467,
         lon: -84.3626,
         baseScore: 86,
-        expected: "$28–$40/hr",
-        description: "Premium dining and nightlife zone with strong evening rides."
+        expected: "$28-$40/hr",
+        description: "Premium dining and nightlife zone with strong evening rides.",
       },
       {
         city: "Atlanta",
         name: "Downtown Atlanta",
         type: "downtown",
-        lat: 33.7490,
-        lon: -84.3880,
+        lat: 33.749,
+        lon: -84.388,
         baseScore: 82,
-        expected: "$22–$34/hr",
-        description: "Convention, hotel, commuter, and stadium-driven ride activity."
+        expected: "$22-$34/hr",
+        description: "Convention, hotel, commuter, and stadium-driven ride activity.",
       },
       {
         city: "Atlanta",
@@ -144,8 +301,8 @@ function getCityZones(city) {
         lat: 33.6407,
         lon: -84.4277,
         baseScore: 87,
-        expected: "$24–$38/hr",
-        description: "Major airport demand with consistent ride flow and longer trip potential."
+        expected: "$24-$38/hr",
+        description: "Major airport demand with consistent ride flow and longer trip potential.",
       },
       {
         city: "Atlanta",
@@ -154,9 +311,9 @@ function getCityZones(city) {
         lat: 33.7756,
         lon: -84.3963,
         baseScore: 69,
-        expected: "$18–$28/hr",
-        description: "Student demand and short rides around campus during the day."
-      }
+        expected: "$18-$28/hr",
+        description: "Student demand and short rides around campus during the day.",
+      },
     ],
 
     Miami: [
@@ -167,8 +324,8 @@ function getCityZones(city) {
         lat: 25.7617,
         lon: -80.1918,
         baseScore: 86,
-        expected: "$26–$38/hr",
-        description: "Strong office, residential tower, and nightlife demand."
+        expected: "$26-$38/hr",
+        description: "Strong office, residential tower, and nightlife demand.",
       },
       {
         city: "Miami",
@@ -177,28 +334,28 @@ function getCityZones(city) {
         lat: 25.7826,
         lon: -80.1341,
         baseScore: 91,
-        expected: "$30–$44/hr",
-        description: "One of the hottest nightlife and tourist ride zones in Miami."
+        expected: "$30-$44/hr",
+        description: "One of the hottest nightlife and tourist ride zones in Miami.",
       },
       {
         city: "Miami",
         name: "Wynwood",
         type: "nightlife",
         lat: 25.8005,
-        lon: -80.1990,
+        lon: -80.199,
         baseScore: 84,
-        expected: "$26–$38/hr",
-        description: "Restaurants, bars, and event activity make this a strong evening zone."
+        expected: "$26-$38/hr",
+        description: "Restaurants, bars, and event activity make this a strong evening zone.",
       },
       {
         city: "Miami",
         name: "MIA Airport",
         type: "airport",
         lat: 25.7959,
-        lon: -80.2870,
+        lon: -80.287,
         baseScore: 82,
-        expected: "$22–$36/hr",
-        description: "Airport demand can be strong, especially during travel rush windows."
+        expected: "$22-$36/hr",
+        description: "Airport demand can be strong, especially during travel rush windows.",
       },
       {
         city: "Miami",
@@ -207,9 +364,9 @@ function getCityZones(city) {
         lat: 25.7215,
         lon: -80.2684,
         baseScore: 71,
-        expected: "$18–$29/hr",
-        description: "Steady upscale local demand near shopping and dining."
-      }
+        expected: "$18-$29/hr",
+        description: "Steady upscale local demand near shopping and dining.",
+      },
     ],
 
     Orlando: [
@@ -220,8 +377,8 @@ function getCityZones(city) {
         lat: 28.5383,
         lon: -81.3792,
         baseScore: 80,
-        expected: "$22–$33/hr",
-        description: "Good central demand with offices, nightlife, and events."
+        expected: "$22-$33/hr",
+        description: "Good central demand with offices, nightlife, and events.",
       },
       {
         city: "Orlando",
@@ -230,8 +387,8 @@ function getCityZones(city) {
         lat: 28.4489,
         lon: -81.4706,
         baseScore: 86,
-        expected: "$26–$38/hr",
-        description: "Tourism, hotels, dining, and attractions create strong ride demand."
+        expected: "$26-$38/hr",
+        description: "Tourism, hotels, dining, and attractions create strong ride demand.",
       },
       {
         city: "Orlando",
@@ -240,8 +397,8 @@ function getCityZones(city) {
         lat: 28.4743,
         lon: -81.4678,
         baseScore: 84,
-        expected: "$24–$36/hr",
-        description: "Theme park and hotel demand can stay active all day."
+        expected: "$24-$36/hr",
+        description: "Theme park and hotel demand can stay active all day.",
       },
       {
         city: "Orlando",
@@ -250,8 +407,8 @@ function getCityZones(city) {
         lat: 28.4312,
         lon: -81.3081,
         baseScore: 85,
-        expected: "$24–$37/hr",
-        description: "Airport rides and hotel transfers make this a strong zone."
+        expected: "$24-$37/hr",
+        description: "Airport rides and hotel transfers make this a strong zone.",
       },
       {
         city: "Orlando",
@@ -260,9 +417,9 @@ function getCityZones(city) {
         lat: 28.6024,
         lon: -81.2001,
         baseScore: 68,
-        expected: "$18–$28/hr",
-        description: "Student traffic and short trips around campus."
-      }
+        expected: "$18-$28/hr",
+        description: "Student traffic and short trips around campus.",
+      },
     ],
 
     Tampa: [
@@ -273,8 +430,8 @@ function getCityZones(city) {
         lat: 27.9506,
         lon: -82.4572,
         baseScore: 82,
-        expected: "$22–$34/hr",
-        description: "Good downtown traffic with offices, hotels, and events."
+        expected: "$22-$34/hr",
+        description: "Good downtown traffic with offices, hotels, and events.",
       },
       {
         city: "Tampa",
@@ -283,8 +440,8 @@ function getCityZones(city) {
         lat: 27.9606,
         lon: -82.4374,
         baseScore: 87,
-        expected: "$28–$40/hr",
-        description: "Strong nightlife demand, especially late evenings and weekends."
+        expected: "$28-$40/hr",
+        description: "Strong nightlife demand, especially late evenings and weekends.",
       },
       {
         city: "Tampa",
@@ -293,8 +450,8 @@ function getCityZones(city) {
         lat: 27.9755,
         lon: -82.5332,
         baseScore: 83,
-        expected: "$22–$35/hr",
-        description: "Airport trips can be reliable during travel-heavy periods."
+        expected: "$22-$35/hr",
+        description: "Airport trips can be reliable during travel-heavy periods.",
       },
       {
         city: "Tampa",
@@ -303,8 +460,8 @@ function getCityZones(city) {
         lat: 27.9427,
         lon: -82.4452,
         baseScore: 79,
-        expected: "$22–$34/hr",
-        description: "Restaurants, events, and waterfront activity can make this productive."
+        expected: "$22-$34/hr",
+        description: "Restaurants, events, and waterfront activity can make this productive.",
       },
       {
         city: "Tampa",
@@ -313,9 +470,9 @@ function getCityZones(city) {
         lat: 28.0587,
         lon: -82.4139,
         baseScore: 67,
-        expected: "$18–$27/hr",
-        description: "Student traffic and short rides around campus."
-      }
+        expected: "$18-$27/hr",
+        description: "Student traffic and short rides around campus.",
+      },
     ],
 
     Nashville: [
@@ -326,8 +483,8 @@ function getCityZones(city) {
         lat: 36.1627,
         lon: -86.7816,
         baseScore: 84,
-        expected: "$24–$35/hr",
-        description: "Core central demand with hotels, events, and music venues."
+        expected: "$24-$35/hr",
+        description: "Core central demand with hotels, events, and music venues.",
       },
       {
         city: "Nashville",
@@ -336,8 +493,8 @@ function getCityZones(city) {
         lat: 36.1592,
         lon: -86.7762,
         baseScore: 92,
-        expected: "$30–$45/hr",
-        description: "One of the strongest nightlife strips for rides in the city."
+        expected: "$30-$45/hr",
+        description: "One of the strongest nightlife strips for rides in the city.",
       },
       {
         city: "Nashville",
@@ -346,8 +503,8 @@ function getCityZones(city) {
         lat: 36.1533,
         lon: -86.7831,
         baseScore: 80,
-        expected: "$24–$34/hr",
-        description: "Strong dining and entertainment demand, especially evenings."
+        expected: "$24-$34/hr",
+        description: "Strong dining and entertainment demand, especially evenings.",
       },
       {
         city: "Nashville",
@@ -356,8 +513,8 @@ function getCityZones(city) {
         lat: 36.1245,
         lon: -86.6782,
         baseScore: 81,
-        expected: "$22–$34/hr",
-        description: "Airport traffic with steady ride demand and longer trip potential."
+        expected: "$22-$34/hr",
+        description: "Airport traffic with steady ride demand and longer trip potential.",
       },
       {
         city: "Nashville",
@@ -366,9 +523,9 @@ function getCityZones(city) {
         lat: 36.1447,
         lon: -86.8027,
         baseScore: 68,
-        expected: "$18–$28/hr",
-        description: "Student and medical district traffic can create short efficient rides."
-      }
+        expected: "$18-$28/hr",
+        description: "Student and medical district traffic can create short efficient rides.",
+      },
     ],
 
     Dallas: [
@@ -377,10 +534,10 @@ function getCityZones(city) {
         name: "Downtown Dallas",
         type: "downtown",
         lat: 32.7767,
-        lon: -96.7970,
+        lon: -96.797,
         baseScore: 83,
-        expected: "$22–$34/hr",
-        description: "Central business and hotel demand with event support."
+        expected: "$22-$34/hr",
+        description: "Central business and hotel demand with event support.",
       },
       {
         city: "Dallas",
@@ -389,8 +546,8 @@ function getCityZones(city) {
         lat: 32.8025,
         lon: -96.8003,
         baseScore: 87,
-        expected: "$28–$40/hr",
-        description: "One of the best dining and nightlife zones in Dallas."
+        expected: "$28-$40/hr",
+        description: "One of the best dining and nightlife zones in Dallas.",
       },
       {
         city: "Dallas",
@@ -399,8 +556,8 @@ function getCityZones(city) {
         lat: 32.7843,
         lon: -96.7849,
         baseScore: 84,
-        expected: "$26–$38/hr",
-        description: "Strong bars, concerts, and entertainment demand."
+        expected: "$26-$38/hr",
+        description: "Strong bars, concerts, and entertainment demand.",
       },
       {
         city: "Dallas",
@@ -409,8 +566,8 @@ function getCityZones(city) {
         lat: 32.8998,
         lon: -97.0403,
         baseScore: 85,
-        expected: "$24–$37/hr",
-        description: "Large airport with strong ride flow during travel windows."
+        expected: "$24-$37/hr",
+        description: "Large airport with strong ride flow during travel windows.",
       },
       {
         city: "Dallas",
@@ -419,9 +576,9 @@ function getCityZones(city) {
         lat: 32.8426,
         lon: -96.7849,
         baseScore: 67,
-        expected: "$18–$27/hr",
-        description: "Campus and student demand with short ride opportunities."
-      }
+        expected: "$18-$27/hr",
+        description: "Campus and student demand with short ride opportunities.",
+      },
     ],
 
     Houston: [
@@ -432,8 +589,8 @@ function getCityZones(city) {
         lat: 29.7604,
         lon: -95.3698,
         baseScore: 82,
-        expected: "$22–$34/hr",
-        description: "Strong downtown demand with offices, hotels, and event venues."
+        expected: "$22-$34/hr",
+        description: "Strong downtown demand with offices, hotels, and event venues.",
       },
       {
         city: "Houston",
@@ -442,8 +599,8 @@ function getCityZones(city) {
         lat: 29.7395,
         lon: -95.3772,
         baseScore: 86,
-        expected: "$26–$39/hr",
-        description: "Popular nightlife and dining zone that performs well in evenings."
+        expected: "$26-$39/hr",
+        description: "Popular nightlife and dining zone that performs well in evenings.",
       },
       {
         city: "Houston",
@@ -452,8 +609,8 @@ function getCityZones(city) {
         lat: 29.7397,
         lon: -95.4612,
         baseScore: 78,
-        expected: "$20–$31/hr",
-        description: "Strong retail, hotel, and business traffic."
+        expected: "$20-$31/hr",
+        description: "Strong retail, hotel, and business traffic.",
       },
       {
         city: "Houston",
@@ -462,19 +619,19 @@ function getCityZones(city) {
         lat: 29.9902,
         lon: -95.3368,
         baseScore: 84,
-        expected: "$23–$36/hr",
-        description: "Large airport with strong ride opportunities during travel peaks."
+        expected: "$23-$36/hr",
+        description: "Large airport with strong ride opportunities during travel peaks.",
       },
       {
         city: "Houston",
         name: "Rice Village",
         type: "university",
         lat: 29.7153,
-        lon: -95.4140,
+        lon: -95.414,
         baseScore: 68,
-        expected: "$18–$28/hr",
-        description: "Good local demand near campus, shopping, and dining."
-      }
+        expected: "$18-$28/hr",
+        description: "Good local demand near campus, shopping, and dining.",
+      },
     ],
 
     Austin: [
@@ -485,8 +642,8 @@ function getCityZones(city) {
         lat: 30.2672,
         lon: -97.7431,
         baseScore: 84,
-        expected: "$24–$35/hr",
-        description: "Strong downtown demand with offices, events, and hotel traffic."
+        expected: "$24-$35/hr",
+        description: "Strong downtown demand with offices, events, and hotel traffic.",
       },
       {
         city: "Austin",
@@ -495,8 +652,8 @@ function getCityZones(city) {
         lat: 30.2676,
         lon: -97.7363,
         baseScore: 91,
-        expected: "$30–$44/hr",
-        description: "One of the hottest nightlife corridors for rides in Austin."
+        expected: "$30-$44/hr",
+        description: "One of the hottest nightlife corridors for rides in Austin.",
       },
       {
         city: "Austin",
@@ -505,8 +662,8 @@ function getCityZones(city) {
         lat: 30.2493,
         lon: -97.7495,
         baseScore: 81,
-        expected: "$24–$35/hr",
-        description: "Dining, shopping, and nightlife create strong local demand."
+        expected: "$24-$35/hr",
+        description: "Dining, shopping, and nightlife create strong local demand.",
       },
       {
         city: "Austin",
@@ -515,8 +672,8 @@ function getCityZones(city) {
         lat: 30.1975,
         lon: -97.6664,
         baseScore: 82,
-        expected: "$22–$34/hr",
-        description: "Airport demand with solid travel-driven rides."
+        expected: "$22-$34/hr",
+        description: "Airport demand with solid travel-driven rides.",
       },
       {
         city: "Austin",
@@ -525,9 +682,9 @@ function getCityZones(city) {
         lat: 30.2849,
         lon: -97.7341,
         baseScore: 70,
-        expected: "$18–$29/hr",
-        description: "Student demand and short trips around campus."
-      }
+        expected: "$18-$29/hr",
+        description: "Student demand and short trips around campus.",
+      },
     ],
 
     Chicago: [
@@ -538,18 +695,18 @@ function getCityZones(city) {
         lat: 41.8781,
         lon: -87.6298,
         baseScore: 86,
-        expected: "$24–$36/hr",
-        description: "Heavy central demand from offices, hotels, and train commuters."
+        expected: "$24-$36/hr",
+        description: "Heavy central demand from offices, hotels, and train commuters.",
       },
       {
         city: "Chicago",
         name: "River North",
         type: "nightlife",
         lat: 41.8924,
-        lon: -87.6340,
+        lon: -87.634,
         baseScore: 88,
-        expected: "$28–$41/hr",
-        description: "One of Chicago’s strongest nightlife and restaurant zones."
+        expected: "$28-$41/hr",
+        description: "One of Chicago’s strongest nightlife and restaurant zones.",
       },
       {
         city: "Chicago",
@@ -558,8 +715,8 @@ function getCityZones(city) {
         lat: 41.9484,
         lon: -87.6553,
         baseScore: 83,
-        expected: "$24–$37/hr",
-        description: "Can spike around baseball games, bars, and event nights."
+        expected: "$24-$37/hr",
+        description: "Can spike around baseball games, bars, and event nights.",
       },
       {
         city: "Chicago",
@@ -568,8 +725,8 @@ function getCityZones(city) {
         lat: 41.9742,
         lon: -87.9073,
         baseScore: 84,
-        expected: "$23–$36/hr",
-        description: "Large airport with consistent travel-related ride demand."
+        expected: "$23-$36/hr",
+        description: "Large airport with consistent travel-related ride demand.",
       },
       {
         city: "Chicago",
@@ -578,9 +735,9 @@ function getCityZones(city) {
         lat: 41.7943,
         lon: -87.5907,
         baseScore: 66,
-        expected: "$18–$27/hr",
-        description: "Campus and local neighborhood demand with shorter trips."
-      }
+        expected: "$18-$27/hr",
+        description: "Campus and local neighborhood demand with shorter trips.",
+      },
     ],
 
     "New York": [
@@ -589,30 +746,30 @@ function getCityZones(city) {
         name: "Midtown Manhattan",
         type: "downtown",
         lat: 40.7549,
-        lon: -73.9840,
+        lon: -73.984,
         baseScore: 90,
-        expected: "$28–$42/hr",
-        description: "Dense hotel, business, tourist, and event activity all day."
+        expected: "$28-$42/hr",
+        description: "Dense hotel, business, tourist, and event activity all day.",
       },
       {
         city: "New York",
         name: "Times Square",
         type: "nightlife",
-        lat: 40.7580,
+        lat: 40.758,
         lon: -73.9855,
         baseScore: 89,
-        expected: "$30–$44/hr",
-        description: "Heavy tourist and nightlife demand, especially evenings."
+        expected: "$30-$44/hr",
+        description: "Heavy tourist and nightlife demand, especially evenings.",
       },
       {
         city: "New York",
         name: "Lower Manhattan",
         type: "downtown",
-        lat: 40.7060,
+        lat: 40.706,
         lon: -74.0086,
         baseScore: 84,
-        expected: "$24–$36/hr",
-        description: "Strong commuter, business, and hotel-driven ride demand."
+        expected: "$24-$36/hr",
+        description: "Strong commuter, business, and hotel-driven ride demand.",
       },
       {
         city: "New York",
@@ -621,8 +778,8 @@ function getCityZones(city) {
         lat: 40.6413,
         lon: -73.7781,
         baseScore: 86,
-        expected: "$24–$38/hr",
-        description: "Major airport zone with strong long-ride potential."
+        expected: "$24-$38/hr",
+        description: "Major airport zone with strong long-ride potential.",
       },
       {
         city: "New York",
@@ -631,9 +788,9 @@ function getCityZones(city) {
         lat: 40.7295,
         lon: -73.9965,
         baseScore: 77,
-        expected: "$22–$33/hr",
-        description: "Student, nightlife, and local demand create steady trips."
-      }
+        expected: "$22-$33/hr",
+        description: "Student, nightlife, and local demand create steady trips.",
+      },
     ],
 
     "Los Angeles": [
@@ -644,8 +801,8 @@ function getCityZones(city) {
         lat: 34.0522,
         lon: -118.2437,
         baseScore: 84,
-        expected: "$22–$34/hr",
-        description: "Central business, hotel, and event-driven ride traffic."
+        expected: "$22-$34/hr",
+        description: "Central business, hotel, and event-driven ride traffic.",
       },
       {
         city: "Los Angeles",
@@ -654,8 +811,8 @@ function getCityZones(city) {
         lat: 34.0928,
         lon: -118.3287,
         baseScore: 89,
-        expected: "$28–$41/hr",
-        description: "Nightlife, tourism, and entertainment make this a strong zone."
+        expected: "$28-$41/hr",
+        description: "Nightlife, tourism, and entertainment make this a strong zone.",
       },
       {
         city: "Los Angeles",
@@ -664,8 +821,8 @@ function getCityZones(city) {
         lat: 34.0195,
         lon: -118.4912,
         baseScore: 82,
-        expected: "$24–$35/hr",
-        description: "Beach, dining, hotels, and nightlife create good ride demand."
+        expected: "$24-$35/hr",
+        description: "Beach, dining, hotels, and nightlife create good ride demand.",
       },
       {
         city: "Los Angeles",
@@ -674,8 +831,8 @@ function getCityZones(city) {
         lat: 33.9416,
         lon: -118.4085,
         baseScore: 88,
-        expected: "$24–$38/hr",
-        description: "One of the strongest airport demand zones in the region."
+        expected: "$24-$38/hr",
+        description: "One of the strongest airport demand zones in the region.",
       },
       {
         city: "Los Angeles",
@@ -684,9 +841,9 @@ function getCityZones(city) {
         lat: 34.0224,
         lon: -118.2851,
         baseScore: 68,
-        expected: "$18–$28/hr",
-        description: "Student and campus traffic can create steady short rides."
-      }
+        expected: "$18-$28/hr",
+        description: "Student and campus traffic can create steady short rides.",
+      },
     ],
 
     Phoenix: [
@@ -695,10 +852,10 @@ function getCityZones(city) {
         name: "Downtown Phoenix",
         type: "downtown",
         lat: 33.4484,
-        lon: -112.0740,
+        lon: -112.074,
         baseScore: 81,
-        expected: "$22–$33/hr",
-        description: "Central business and event activity keep rides flowing."
+        expected: "$22-$33/hr",
+        description: "Central business and event activity keep rides flowing.",
       },
       {
         city: "Phoenix",
@@ -707,18 +864,18 @@ function getCityZones(city) {
         lat: 33.4942,
         lon: -111.9261,
         baseScore: 90,
-        expected: "$30–$43/hr",
-        description: "One of the hottest nightlife destinations in the metro area."
+        expected: "$30-$43/hr",
+        description: "One of the hottest nightlife destinations in the metro area.",
       },
       {
         city: "Phoenix",
         name: "Tempe",
         type: "university",
         lat: 33.4255,
-        lon: -111.9400,
+        lon: -111.94,
         baseScore: 76,
-        expected: "$20–$31/hr",
-        description: "Student life, bars, and local activity support ride demand."
+        expected: "$20-$31/hr",
+        description: "Student life, bars, and local activity support ride demand.",
       },
       {
         city: "Phoenix",
@@ -727,8 +884,8 @@ function getCityZones(city) {
         lat: 33.4342,
         lon: -112.0116,
         baseScore: 84,
-        expected: "$23–$35/hr",
-        description: "Airport rides perform well during travel-heavy windows."
+        expected: "$23-$35/hr",
+        description: "Airport rides perform well during travel-heavy windows.",
       },
       {
         city: "Phoenix",
@@ -737,9 +894,9 @@ function getCityZones(city) {
         lat: 33.5092,
         lon: -112.0275,
         baseScore: 70,
-        expected: "$18–$29/hr",
-        description: "Steady local demand near hotels, shopping, and business."
-      }
+        expected: "$18-$29/hr",
+        description: "Steady local demand near hotels, shopping, and business.",
+      },
     ],
 
     "Las Vegas": [
@@ -750,28 +907,28 @@ function getCityZones(city) {
         lat: 36.1147,
         lon: -115.1728,
         baseScore: 95,
-        expected: "$32–$48/hr",
-        description: "Top nightlife and tourist ride zone with constant hotel traffic."
+        expected: "$32-$48/hr",
+        description: "Top nightlife and tourist ride zone with constant hotel traffic.",
       },
       {
         city: "Las Vegas",
         name: "Fremont Street",
         type: "nightlife",
-        lat: 36.1700,
+        lat: 36.17,
         lon: -115.1447,
         baseScore: 88,
-        expected: "$28–$42/hr",
-        description: "Strong entertainment and nightlife rides, especially evenings."
+        expected: "$28-$42/hr",
+        description: "Strong entertainment and nightlife rides, especially evenings.",
       },
       {
         city: "Las Vegas",
         name: "Harry Reid Airport",
         type: "airport",
-        lat: 36.0840,
+        lat: 36.084,
         lon: -115.1537,
         baseScore: 86,
-        expected: "$24–$38/hr",
-        description: "Airport demand is consistently strong with good long-ride potential."
+        expected: "$24-$38/hr",
+        description: "Airport demand is consistently strong with good long-ride potential.",
       },
       {
         city: "Las Vegas",
@@ -780,19 +937,19 @@ function getCityZones(city) {
         lat: 36.1319,
         lon: -115.1512,
         baseScore: 83,
-        expected: "$24–$36/hr",
-        description: "Conventions and hotel activity can drive strong ride demand."
+        expected: "$24-$36/hr",
+        description: "Conventions and hotel activity can drive strong ride demand.",
       },
       {
         city: "Las Vegas",
         name: "Summerlin",
         type: "shopping",
         lat: 36.1699,
-        lon: -115.2910,
+        lon: -115.291,
         baseScore: 65,
-        expected: "$17–$27/hr",
-        description: "More residential and spread out, but can support local rides."
-      }
+        expected: "$17-$27/hr",
+        description: "More residential and spread out, but can support local rides.",
+      },
     ],
 
     "San Francisco": [
@@ -803,8 +960,8 @@ function getCityZones(city) {
         lat: 37.7946,
         lon: -122.3999,
         baseScore: 84,
-        expected: "$24–$36/hr",
-        description: "Strong weekday office and hotel demand in the city core."
+        expected: "$24-$36/hr",
+        description: "Strong weekday office and hotel demand in the city core.",
       },
       {
         city: "San Francisco",
@@ -813,8 +970,8 @@ function getCityZones(city) {
         lat: 37.7786,
         lon: -122.4056,
         baseScore: 82,
-        expected: "$22–$34/hr",
-        description: "Event venues, business density, and nightlife create solid demand."
+        expected: "$22-$34/hr",
+        description: "Event venues, business density, and nightlife create solid demand.",
       },
       {
         city: "San Francisco",
@@ -823,18 +980,18 @@ function getCityZones(city) {
         lat: 37.7599,
         lon: -122.4148,
         baseScore: 86,
-        expected: "$26–$38/hr",
-        description: "Restaurants, bars, and local nightlife make this a strong evening zone."
+        expected: "$26-$38/hr",
+        description: "Restaurants, bars, and local nightlife make this a strong evening zone.",
       },
       {
         city: "San Francisco",
         name: "SFO Airport",
         type: "airport",
         lat: 37.6213,
-        lon: -122.3790,
+        lon: -122.379,
         baseScore: 85,
-        expected: "$24–$37/hr",
-        description: "Airport rides can be strong during heavy travel windows."
+        expected: "$24-$37/hr",
+        description: "Airport rides can be strong during heavy travel windows.",
       },
       {
         city: "San Francisco",
@@ -843,9 +1000,9 @@ function getCityZones(city) {
         lat: 37.7756,
         lon: -122.4507,
         baseScore: 68,
-        expected: "$18–$28/hr",
-        description: "Campus and neighborhood activity support steady shorter trips."
-      }
+        expected: "$18-$28/hr",
+        description: "Campus and neighborhood activity support steady shorter trips.",
+      },
     ],
 
     Seattle: [
@@ -856,8 +1013,8 @@ function getCityZones(city) {
         lat: 47.6062,
         lon: -122.3321,
         baseScore: 84,
-        expected: "$24–$35/hr",
-        description: "Strong core demand with hotels, offices, and event traffic."
+        expected: "$24-$35/hr",
+        description: "Strong core demand with hotels, offices, and event traffic.",
       },
       {
         city: "Seattle",
@@ -866,8 +1023,8 @@ function getCityZones(city) {
         lat: 47.6231,
         lon: -122.3191,
         baseScore: 88,
-        expected: "$28–$40/hr",
-        description: "One of Seattle’s best nightlife and dining zones."
+        expected: "$28-$40/hr",
+        description: "One of Seattle’s best nightlife and dining zones.",
       },
       {
         city: "Seattle",
@@ -876,8 +1033,8 @@ function getCityZones(city) {
         lat: 47.6145,
         lon: -122.3451,
         baseScore: 82,
-        expected: "$24–$35/hr",
-        description: "Hotels, bars, and downtown spillover keep rides active."
+        expected: "$24-$35/hr",
+        description: "Hotels, bars, and downtown spillover keep rides active.",
       },
       {
         city: "Seattle",
@@ -886,8 +1043,8 @@ function getCityZones(city) {
         lat: 47.4502,
         lon: -122.3088,
         baseScore: 86,
-        expected: "$24–$37/hr",
-        description: "Airport rides are usually strong during travel peaks."
+        expected: "$24-$37/hr",
+        description: "Airport rides are usually strong during travel peaks.",
       },
       {
         city: "Seattle",
@@ -896,14 +1053,18 @@ function getCityZones(city) {
         lat: 47.6613,
         lon: -122.3131,
         baseScore: 69,
-        expected: "$18–$29/hr",
-        description: "Student demand and local trips near campus."
-      }
-    ]
+        expected: "$18-$29/hr",
+        description: "Student demand and local trips near campus.",
+      },
+    ],
   };
 
   return zoneMap[city] || zoneMap["Charlotte"];
 }
+
+// --------------------------------------------------
+// RADAR UTILS
+// --------------------------------------------------
 
 function timeBonus(type, hour) {
   switch (type) {
@@ -1009,8 +1170,67 @@ function formatEventSummary(events) {
     .join("\n");
 }
 
+// --------------------------------------------------
+// ROUTES
+// --------------------------------------------------
+
 app.get("/", (req, res) => {
   res.send("GigProfit AI backend running");
+});
+
+app.post("/community/report", (req, res) => {
+  try {
+    const {
+      city,
+      zone,
+      pay,
+      miles,
+      minutes,
+      source = "scan",
+    } = req.body || {};
+
+    const payNumber = Number(pay);
+    const milesNumber = Number(miles);
+    const minutesNumber = Number(minutes);
+
+    if (
+      !city ||
+      !zone ||
+      Number.isNaN(payNumber) ||
+      Number.isNaN(milesNumber) ||
+      Number.isNaN(minutesNumber) ||
+      payNumber <= 0 ||
+      milesNumber <= 0 ||
+      minutesNumber <= 0
+    ) {
+      return res.status(400).json({ error: "Invalid community report payload" });
+    }
+
+    const hourlyRate = (payNumber / minutesNumber) * 60;
+    const dollarsPerMile = payNumber / milesNumber;
+
+    communityReports.push({
+      city,
+      zone,
+      pay: payNumber,
+      miles: milesNumber,
+      minutes: minutesNumber,
+      hourlyRate,
+      dollarsPerMile,
+      source,
+      createdAt: Date.now(),
+    });
+
+    cleanupCommunityReports();
+
+    return res.json({
+      ok: true,
+      reportsInMemory: communityReports.length,
+    });
+  } catch (error) {
+    console.error("COMMUNITY REPORT ERROR:", error);
+    return res.status(500).json({ error: "Community report failed" });
+  }
 });
 
 app.post("/ask", async (req, res) => {
@@ -1126,10 +1346,22 @@ app.post("/radar/recommend", async (req, res) => {
           }
         }
 
+        const level = trafficLevel(driveMinutes);
+        const bonus = timeBonus(zone.type, resolvedHour);
+        const community = getCommunitySnapshot(city, zone.name);
+
+        const dynamicExpected = buildDynamicExpected({
+          baseExpectedText: zone.expected,
+          trafficLevelValue: level,
+          timeBonusPoints: bonus,
+          eventBoost,
+          community,
+        });
+
         const finalScore = Math.max(
           1,
           zone.baseScore +
-            timeBonus(zone.type, resolvedHour) +
+            bonus +
             eventBoost -
             distancePenalty(miles) -
             trafficPenaltyFromMinutes(driveMinutes)
@@ -1137,13 +1369,22 @@ app.post("/radar/recommend", async (req, res) => {
 
         return {
           ...zone,
+          expected: dynamicExpected.expected,
+          expectedLow: dynamicExpected.expectedLow,
+          expectedHigh: dynamicExpected.expectedHigh,
+          expectedSource: dynamicExpected.expectedSource,
+          expectedSampleCount: dynamicExpected.expectedSampleCount,
           distanceMiles: Number(miles.toFixed(1)),
           driveMinutes,
-          trafficLevel: trafficLevel(driveMinutes),
+          trafficLevel: level,
           liveTraffic,
           finalScore,
           eventBoost,
-          nearbyEvents: Array.from(new Set(nearbyEvents)).slice(0, 3)
+          nearbyEvents: Array.from(new Set(nearbyEvents)).slice(0, 3),
+          communityZoneCount: community.zoneCount,
+          communityCityCount: community.cityCount,
+          communityZoneAvgHourly: community.zoneAvgHourly,
+          communityCityAvgHourly: community.cityAvgHourly,
         };
       })
     );
@@ -1175,6 +1416,10 @@ expected earnings: ${z.expected}
 description: ${z.description}
 event boost: ${z.eventBoost}
 nearby events: ${z.nearbyEvents.length ? z.nearbyEvents.join(", ") : "none"}
+community zone count: ${z.communityZoneCount}
+community city count: ${z.communityCityCount}
+community zone avg hourly: ${z.communityZoneAvgHourly ?? "n/a"}
+community city avg hourly: ${z.communityCityAvgHourly ?? "n/a"}
 `
   )
   .join("\n")}
@@ -1221,7 +1466,8 @@ Recommendation:
       bestZone: scoredZones[0],
       zones: scoredZones,
       explanation,
-      events: events.slice(0, 5)
+      events: events.slice(0, 5),
+      communityReportsInMemory: communityReports.length,
     });
   } catch (error) {
     console.error("RADAR ERROR:", error);
