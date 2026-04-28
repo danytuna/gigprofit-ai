@@ -802,6 +802,88 @@ Recommendation:
 });
 
 // --------------------------------------------------
+// OFFLINE STATE PACKS
+// --------------------------------------------------
+
+app.get("/offline/state-pack/:stateCode", async (req, res) => {
+  try {
+    const stateCode = String(req.params.stateCode || "")
+      .trim()
+      .toUpperCase();
+
+    if (!stateCode) {
+      return res.status(400).json({
+        error: "Missing state code",
+      });
+    }
+
+    const supportedStates = [
+      "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
+      "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
+      "MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+      "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC",
+      "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
+    ];
+
+    if (!supportedStates.includes(stateCode)) {
+      return res.status(404).json({
+        error: `State pack not supported for ${stateCode}`,
+      });
+    }
+
+    const samplePayload = {
+      stateCode,
+      downloadedAt: new Date().toISOString(),
+
+      radarZones: [
+        {
+          id: `${stateCode}-zone-1`,
+          name: "Downtown Prime Zone",
+          score: 92,
+          trafficLevel: "moderate",
+          expected: "$28-$42/hr"
+        },
+        {
+          id: `${stateCode}-zone-2`,
+          name: "Airport Surge Zone",
+          score: 88,
+          trafficLevel: "busy",
+          expected: "$24-$38/hr"
+        }
+      ],
+
+      recommendedHotspots: [
+        {
+          id: `${stateCode}-hotspot-1`,
+          title: "Restaurant Cluster",
+          demandLevel: "high"
+        },
+        {
+          id: `${stateCode}-hotspot-2`,
+          title: "Nightlife Area",
+          demandLevel: "medium"
+        }
+      ],
+
+      metadata: {
+        version: 1,
+        source: "GigProfit Offline Pack",
+        optimizedFor: "DriverMap + Radar"
+      }
+    };
+
+    return res.json(samplePayload);
+  } catch (error) {
+    console.error("OFFLINE STATE PACK ERROR:", error);
+
+    return res.status(500).json({
+      error: "Failed to generate offline state pack",
+      details: error?.message || String(error),
+    });
+  }
+});
+
+// --------------------------------------------------
 // PLAID
 // --------------------------------------------------
 
