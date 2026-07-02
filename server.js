@@ -14,6 +14,41 @@ dotenv.config();
 
 const app = express();
 const NODE_ENV = process.env.NODE_ENV || "development";
+
+function validateRequiredEnvironment({
+  nodeEnv,
+  variables,
+}) {
+  const missing = variables.filter((name) => {
+    const value = process.env[name];
+    return typeof value !== "string" || value.trim() === "";
+  });
+
+  if (!missing.length) {
+    return;
+  }
+
+  throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+}
+
+validateRequiredEnvironment({
+  nodeEnv: NODE_ENV,
+  variables: NODE_ENV === "production"
+    ? [
+        "NODE_ENV",
+        "PLAID_ENV",
+        "PLAID_CLIENT_ID",
+        "PLAID_SECRET",
+        "FIREBASE_SERVICE_ACCOUNT_BASE64",
+        "PLAID_TOKEN_ENCRYPTION_KEY",
+        "ALLOWED_ORIGINS",
+        "OPENAI_API_KEY",
+        "TICKETMASTER_API_KEY",
+        "MAPBOX_ACCESS_TOKEN",
+      ]
+    : [],
+});
+
 applyHttpSecurity(app, {
   allowedOrigins: process.env.ALLOWED_ORIGINS || "",
   nodeEnv: NODE_ENV,
@@ -479,16 +514,18 @@ function formatEventSummary(events) {
 // --------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.send("GigProfit backend running 🚀 v3 COPILOT");
+  res.status(200).json({
+    ok: true,
+    service: "gigprofit-ai",
+    environment: NODE_ENV,
+  });
 });
 
 app.get("/health", (req, res) => {
-  res.json({
+  res.status(200).json({
     ok: true,
-    version: "v3-copilot",
-    openaiConfigured: hasOpenAIKey,
-    plaidConfigured: hasPlaidKeys,
-    plaidEnv: PLAID_ENV_RAW,
+    service: "gigprofit-ai",
+    environment: NODE_ENV,
   });
 });
 

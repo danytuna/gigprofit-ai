@@ -4,9 +4,11 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
+    "prestart": "node ./scripts/validate-production-env.js",
     "start": "node server.js",
     "test": "node --test",
-    "lint": "node --check server.js && node --check httpSecurity.js && node --check firebaseAdmin.js && node --check requireFirebaseAuth.js && node --check plaidCrypto.js && node --check plaidStore.js && node --check plaidRouter.js"
+    "lint": "node --check server.js && node --check httpSecurity.js && node --check firebaseAdmin.js && node --check requireFirebaseAuth.js && node --check plaidCrypto.js && node --check plaidStore.js && node --check plaidRouter.js && node --check scripts/validate-production-env.js",
+    "validate:env": "node ./scripts/validate-production-env.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
