@@ -291,10 +291,6 @@ function buildDynamicExpected({
   };
 }
 
-// --------------------------------------------------
-// TICKETMASTER
-// --------------------------------------------------
-
 async function getNearbyEvents(city) {
   const apiKey = process.env.TICKETMASTER_API_KEY;
 
@@ -334,10 +330,6 @@ async function getNearbyEvents(city) {
     return [];
   }
 }
-
-// --------------------------------------------------
-// CITY ZONES
-// --------------------------------------------------
 
 function getCityZones(city) {
   const zoneMap = {
@@ -402,10 +394,6 @@ function getCityZones(city) {
 
   return zoneMap[city] || zoneMap["Charlotte"];
 }
-
-// --------------------------------------------------
-// RADAR HELPERS
-// --------------------------------------------------
 
 function timeBonus(type, hour) {
   switch (type) {
@@ -509,10 +497,6 @@ function formatEventSummary(events) {
     .join("\n");
 }
 
-// --------------------------------------------------
-// BASIC
-// --------------------------------------------------
-
 app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
@@ -528,10 +512,6 @@ app.get("/health", (req, res) => {
     environment: NODE_ENV,
   });
 });
-
-// --------------------------------------------------
-// COMMUNITY
-// --------------------------------------------------
 
 app.post("/community/report", (req, res) => {
   try {
@@ -580,10 +560,6 @@ app.post("/community/report", (req, res) => {
     return res.status(500).json({ error: "Community report failed" });
   }
 });
-
-// --------------------------------------------------
-// AI ASSISTANT
-// --------------------------------------------------
 
 app.post("/ask", async (req, res) => {
   try {
@@ -696,10 +672,6 @@ Rules:
     });
   }
 });
-
-// --------------------------------------------------
-// RADAR
-// --------------------------------------------------
 
 app.post("/radar/recommend", async (req, res) => {
   try {
@@ -909,10 +881,6 @@ Recommendation:
   }
 });
 
-// --------------------------------------------------
-// OFFLINE STATE PACKS
-// --------------------------------------------------
-
 function getOfflineStatePack(stateCode = "NC") {
   const code = String(stateCode || "NC").toUpperCase();
 
@@ -1043,15 +1011,7 @@ app.get("/offline/state-pack", async (req, res) => {
   }
 });
 
-// --------------------------------------------------
-// PLAID
-// --------------------------------------------------
-
 app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
-
-// --------------------------------------------------
-// START
-// --------------------------------------------------
 
 const currentModulePath = fileURLToPath(import.meta.url);
 const invokedPath = process.argv[1] || "";
