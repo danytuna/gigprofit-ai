@@ -1,0 +1,349 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  decryptSecret,
+  encryptSecret,
+  resolveEncryptionKey,
+} from "../plaidCrypto.js";
+import { createPlaidRouter } from "../plaidRouter.js";
+import { createRequireFirebaseAuth } from "../requireFirebaseAuth.js";
+
+function makeBase64Key() {
+  return Buffer.from("12345678901234567890123456789012", "utf8").toString("base64");
+}
+
+function makeMemoryStore(seed = {}) {
+  const records = new Map(
+    Object.entries(seed).map(([uid, items]) => [uid, items.map((item) => ({ ...item }))])
+  );
+
+  return {
+    async saveItem(uid, item) {
+      const items = records.get(uid) || [];
+      const nextItems = items.filter((existing) => existing.itemId !== item.itemId);
+      nextItems.push({
+        ...item,
+        createdAt: item.createdAt || null,
+        updatedAt: item.updatedAt || null,
+      });
+      records.set(uid, nextItems);
+    },
+
+    async getItems(uid) {
+      return (records.get(uid) || []).map((item) => ({ ...item }));
+    },
+
+    async getItem(uid, itemId) {
+      return (records.get(uid) || []).find((item) => item.itemId === itemId) || null;
+    },
+
+    async deleteItem(uid, itemId) {
+      records.set(
+        uid,
+        (records.get(uid) || []).filter((item) => item.itemId !== itemId)
+      );
+    },
+  };
+}
+
+function createTestRouter({ store, plaidClient }) {
+  const requireFirebaseAuth = createRequireFirebaseAuth({
+    async verifyIdToken(token) {
+      if (token === "valid-user-a") {
+        return { uid: "user-a", email: "a@example.com" };
+      }
+
+      if (token === "valid-user-b") {
+        return { uid: "user-b", email: "b@example.com" };
+      }
+
+      throw new Error("invalid");
+    },
+  });
+
+  return createPlaidRouter({
+    plaidClient,
+    hasPlaidKeys: true,
+    plaidEnvironment: "production",
+    requireFirebaseAuth,
+    store,
+    encryptionKey: resolveEncryptionKey({
+      envValue: makeBase64Key(),
+      nodeEnv: "test",
+    }),
+    encryptSecret,
+    decryptSecret,
+    nodeEnv: "test",
+  });
+}
+
+async function invokeRouter(router, { method, url, headers = {}, body = {} }) {
+  return await new Promise((resolve, reject) => {
+    const req = {
+      method,
+      url,
+      originalUrl: url,
+      path: url,
+      headers,
+      body,
+      query: {},
+      get(name) {
+        return this.headers[String(name).toLowerCase()];
+      },
+    };
+
+    const res = {
+      statusCode: 200,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload) {
+        resolve({
+          statusCode: this.statusCode,
+          body: payload,
+        });
+        return this;
+      },
+      setHeader() {},
+    };
+
+    router.handle(req, res, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve({
+        statusCode: res.statusCode,
+        body: null,
+      });
+    });
+  });
+}
+
+test("plaidCrypto encrypts and decrypts with AES-256-GCM", () => {
+  const key = resolveEncryptionKey({
+    envValue: makeBase64Key(),
+    nodeEnv: "test",
+  });
+
+  const payload = encryptSecret("secret-token", key);
+  assert.ok(payload.encryptedAccessToken);
+  assert.ok(payload.iv);
+  assert.ok(payload.authTag);
+  assert.equal(decryptSecret(payload, key), "secret-token");
+});
+
+test("plaid routes require Firebase auth", async () => {
+  const store = makeMemoryStore();
+  const plaidClient = {
+    async itemPublicTokenExchange() {
+      throw new Error("should not reach");
+    },
+  };
+
+  const router = createTestRouter({ store, plaidClient });
+
+  const response = await invokeRouter(router, {
+    method: "GET",
+    url: "/status",
+  });
+
+  assert.equal(response.statusCode, 401);
+  assert.deepEqual(response.body, {
+    ok: false,
+    error: "Unauthorized",
+  });
+});
+
+test("exchange_public_token stores encrypted access token and never returns it", async () => {
+  const store = makeMemoryStore();
+  const plaidClient = {
+    async itemPublicTokenExchange() {
+      return {
+        data: {
+          access_token: "plaid-access-token-1",
+          item_id: "item-1",
+        },
+      };
+    },
+    async itemGet() {
+      return {
+        data: {
+          item: {
+            institution_id: "ins_1",
+          },
+        },
+      };
+    },
+    async accountsGet() {
+      return {
+        data: {
+          accounts: [
+            {
+              account_id: "acc-1",
+              name: "Checking",
+              mask: "1234",
+              subtype: "checking",
+              type: "depository",
+            },
+          ],
+        },
+      };
+    },
+    async institutionsGetById() {
+      return {
+        data: {
+          institution: {
+            name: "GigProfit Test Bank",
+          },
+        },
+      };
+    },
+  };
+
+  const router = createTestRouter({ store, plaidClient });
+
+  const response = await invokeRouter(router, {
+    method: "POST",
+    url: "/exchange_public_token",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+    body: {
+      public_token: "public-sandbox-token",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.connected, true);
+  assert.equal(response.body.item_id, "item-1");
+  assert.equal("access_token" in response.body, false);
+
+  const saved = await store.getItem("user-a", "item-1");
+  assert.ok(saved);
+  assert.notEqual(saved.encryptedAccessToken, "plaid-access-token-1");
+  assert.equal(saved.itemId, "item-1");
+  assert.equal(saved.institutionName, "GigProfit Test Bank");
+});
+
+test("transactions reject client-sent access_token and filter by authenticated user + item_id", async () => {
+  const key = resolveEncryptionKey({
+    envValue: makeBase64Key(),
+    nodeEnv: "test",
+  });
+
+  const store = makeMemoryStore({
+    "user-a": [
+      {
+        ...encryptSecret("token-a1", key),
+        itemId: "item-a1",
+        institutionName: "Alpha Bank",
+        accounts: [{ account_id: "acc-a1", name: "Main", mask: "1111" }],
+      },
+      {
+        ...encryptSecret("token-a2", key),
+        itemId: "item-a2",
+        institutionName: "Bravo Bank",
+        accounts: [{ account_id: "acc-a2", name: "Reserve", mask: "2222" }],
+      },
+    ],
+    "user-b": [
+      {
+        ...encryptSecret("token-b1", key),
+        itemId: "item-b1",
+        institutionName: "Other User Bank",
+        accounts: [{ account_id: "acc-b1", name: "Private", mask: "3333" }],
+      },
+    ],
+  });
+
+  const plaidClient = {
+    async transactionsGet({ access_token }) {
+      if (access_token === "token-a1") {
+        return {
+          data: {
+            transactions: [
+              {
+                transaction_id: "tx-a1",
+                account_id: "acc-a1",
+                name: "Fuel Stop",
+                merchant_name: "Fuel Stop",
+                amount: 18.75,
+                date: "2026-06-20",
+                category: ["Travel", "Gas"],
+                pending: false,
+                iso_currency_code: "USD",
+              },
+            ],
+          },
+        };
+      }
+
+      if (access_token === "token-a2") {
+        return {
+          data: {
+            transactions: [
+              {
+                transaction_id: "tx-a2",
+                account_id: "acc-a2",
+                name: "Parking Deck",
+                merchant_name: "Parking Deck",
+                amount: 12,
+                date: "2026-06-19",
+                category: ["Travel", "Parking"],
+                pending: false,
+                iso_currency_code: "USD",
+              },
+            ],
+          },
+        };
+      }
+
+      return {
+        data: {
+          transactions: [],
+        },
+      };
+    },
+  };
+
+  const router = createTestRouter({ store, plaidClient });
+
+  const rejected = await invokeRouter(router, {
+    method: "POST",
+    url: "/transactions",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+    body: {
+      access_token: "should-never-be-accepted",
+      start_date: "2026-01-01",
+      end_date: "2026-06-30",
+    },
+  });
+
+  assert.equal(rejected.statusCode, 400);
+
+  const filtered = await invokeRouter(router, {
+    method: "POST",
+    url: "/transactions",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+    body: {
+      item_id: "item-a2",
+      start_date: "2026-01-01",
+      end_date: "2026-06-30",
+    },
+  });
+
+  assert.equal(filtered.statusCode, 200);
+  assert.equal(filtered.body.transactions.length, 1);
+  assert.equal(filtered.body.transactions[0].transaction_id, "tx-a2");
+  assert.equal(filtered.body.transactions[0].item_id, "item-a2");
+  assert.equal(filtered.body.transactions[0].institution_name, "Bravo Bank");
+});

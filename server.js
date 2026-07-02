@@ -1,14 +1,24 @@
 import express from "express";
-import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
+import { fileURLToPath } from "url";
+import { applyHttpSecurity, createPlaidRateLimiter } from "./httpSecurity.js";
+import { getFirebaseAdminServices } from "./firebaseAdmin.js";
+import { createRequireFirebaseAuth } from "./requireFirebaseAuth.js";
+import { resolveEncryptionKey, encryptSecret, decryptSecret } from "./plaidCrypto.js";
+import { createPlaidStore } from "./plaidStore.js";
+import { createPlaidRouter } from "./plaidRouter.js";
 
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const NODE_ENV = process.env.NODE_ENV || "development";
+applyHttpSecurity(app, {
+  allowedOrigins: process.env.ALLOWED_ORIGINS || "",
+  nodeEnv: NODE_ENV,
+});
+app.use(express.json({ limit: "100kb" }));
 
 const PORT = process.env.PORT || 8080;
 
@@ -16,7 +26,7 @@ const PORT = process.env.PORT || 8080;
 // ENV HELPERS
 // --------------------------------------------------
 
-const PLAID_ENV_RAW = (process.env.PLAID_ENV || "sandbox").toLowerCase();
+const PLAID_ENV_RAW = (process.env.PLAID_ENV || "production").toLowerCase();
 
 const resolvedPlaidEnvironment =
   PLAID_ENV_RAW === "production"
@@ -29,6 +39,22 @@ const hasPlaidKeys =
   !!process.env.PLAID_CLIENT_ID && !!process.env.PLAID_SECRET;
 
 const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
+const plaidEncryptionKey = resolveEncryptionKey({
+  envValue: process.env.PLAID_TOKEN_ENCRYPTION_KEY || "",
+  nodeEnv: NODE_ENV,
+});
+const firebaseAdminServices = getFirebaseAdminServices({
+  serviceAccountBase64:
+    process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "",
+  nodeEnv: NODE_ENV,
+});
+const requireFirebaseAuth = createRequireFirebaseAuth(
+  firebaseAdminServices.auth
+);
+const plaidStore = createPlaidStore(
+  firebaseAdminServices.firestore,
+  firebaseAdminServices.admin
+);
 
 // --------------------------------------------------
 // OPENAI
@@ -53,6 +79,18 @@ const plaidClient = new PlaidApi(
     },
   })
 );
+
+const plaidRouter = createPlaidRouter({
+  plaidClient,
+  hasPlaidKeys,
+  plaidEnvironment: PLAID_ENV_RAW,
+  requireFirebaseAuth,
+  store: plaidStore,
+  encryptionKey: plaidEncryptionKey,
+  encryptSecret,
+  decryptSecret,
+  nodeEnv: NODE_ENV,
+});
 
 // --------------------------------------------------
 // COMMUNITY REPORTS (memory-only v1)
@@ -269,11 +307,61 @@ async function getNearbyEvents(city) {
 function getCityZones(city) {
   const zoneMap = {
     Charlotte: [
-      { city: "Charlotte", name: "Uptown", type: "downtown", lat: 35.2271, lon: -80.8431, baseScore: 84, expected: "$24-$36/hr", description: "Strong business, hotel, commuter, and event traffic in central Charlotte." },
-      { city: "Charlotte", name: "South End", type: "nightlife", lat: 35.2130, lon: -80.8576, baseScore: 88, expected: "$28-$40/hr", description: "One of the best nightlife and restaurant zones in Charlotte, especially evenings." },
-      { city: "Charlotte", name: "NoDa", type: "nightlife", lat: 35.2479, lon: -80.8057, baseScore: 78, expected: "$22-$34/hr", description: "Popular arts and bar district with solid evening and weekend demand." },
-      { city: "Charlotte", name: "CLT Airport", type: "airport", lat: 35.2144, lon: -80.9473, baseScore: 80, expected: "$22-$35/hr", description: "Strong airport demand during travel peaks and useful for longer rides." },
-      { city: "Charlotte", name: "University City", type: "university", lat: 35.3071, lon: -80.7359, baseScore: 70, expected: "$18-$28/hr", description: "Student and campus traffic can create short-trip demand during active hours." },
+      {
+        city: "Charlotte",
+        name: "Uptown",
+        type: "downtown",
+        lat: 35.2271,
+        lon: -80.8431,
+        baseScore: 84,
+        expected: "$24-$36/hr",
+        description:
+          "Strong business, hotel, commuter, and event traffic in central Charlotte.",
+      },
+      {
+        city: "Charlotte",
+        name: "South End",
+        type: "nightlife",
+        lat: 35.213,
+        lon: -80.8576,
+        baseScore: 88,
+        expected: "$28-$40/hr",
+        description:
+          "One of the best nightlife and restaurant zones in Charlotte, especially evenings.",
+      },
+      {
+        city: "Charlotte",
+        name: "NoDa",
+        type: "nightlife",
+        lat: 35.2479,
+        lon: -80.8057,
+        baseScore: 78,
+        expected: "$22-$34/hr",
+        description:
+          "Popular arts and bar district with solid evening and weekend demand.",
+      },
+      {
+        city: "Charlotte",
+        name: "CLT Airport",
+        type: "airport",
+        lat: 35.2144,
+        lon: -80.9473,
+        baseScore: 80,
+        expected: "$22-$35/hr",
+        description:
+          "Strong airport demand during travel peaks and useful for longer rides.",
+      },
+      {
+        city: "Charlotte",
+        name: "University City",
+        type: "university",
+        lat: 35.3071,
+        lon: -80.7359,
+        baseScore: 70,
+        expected: "$18-$28/hr",
+        description:
+          "Student and campus traffic can create short-trip demand during active hours.",
+      },
     ],
   };
 
@@ -391,12 +479,13 @@ function formatEventSummary(events) {
 // --------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.send("GigProfit backend running 🚀");
+  res.send("GigProfit backend running 🚀 v3 COPILOT");
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
+    version: "v3-copilot",
     openaiConfigured: hasOpenAIKey,
     plaidConfigured: hasPlaidKeys,
     plaidEnv: PLAID_ENV_RAW,
@@ -465,48 +554,109 @@ app.post("/ask", async (req, res) => {
       return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
     }
 
-    const { prompt } = req.body;
+    const {
+      prompt,
+      context = "",
+      mode = "general",
+      conversation = [],
+    } = req.body || {};
 
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "Missing prompt" });
     }
 
+    console.log("ASK HIT ✅");
+    console.log("Mode:", mode);
+    console.log("Prompt preview:", prompt.slice(0, 180));
+
+    const systemPrompt = `
+You are GigProfit AI, a smart and natural copilot for Uber and Lyft drivers using the GigProfit app.
+
+Your job:
+- help drivers make better earning decisions
+- explain things clearly and naturally
+- sound practical, confident, and human
+- avoid robotic or overly polished language
+- adapt to the user's request based on mode
+
+Modes:
+- general: answer normally
+- app_help: explain how to use GigProfit features clearly
+- ride_analysis: analyze rides using pay, miles, time, dollars per mile, and dollars per hour
+- tax_help: help with business expense, mileage, and tax organization
+- radar_help: help interpret zones, events, and move decisions
+
+Rules:
+- no markdown tables
+- no academic tone
+- no unnecessary disclaimers
+- keep answers structured but natural
+- if information is missing, say what is missing
+- if comparing rides, evaluate value, efficiency, and time cost
+- if helping with the app, explain step by step when useful
+- if the request is unclear, ask one short clarifying question
+`.trim();
+
+    const messages = [
+      {
+        role: "system",
+        content: systemPrompt,
+      },
+    ];
+
+    if (context && typeof context === "string" && context.trim()) {
+      messages.push({
+        role: "system",
+        content: `App context:\n${context.trim()}`,
+      });
+    }
+
+    if (Array.isArray(conversation)) {
+      for (const item of conversation.slice(-8)) {
+        if (
+          item &&
+          (item.role === "user" || item.role === "assistant") &&
+          typeof item.content === "string" &&
+          item.content.trim()
+        ) {
+          messages.push({
+            role: item.role,
+            content: item.content.trim(),
+          });
+        }
+      }
+    }
+
+    messages.push({
+      role: "user",
+      content: `Mode: ${mode}\n\nUser request:\n${prompt}`,
+    });
+
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.4,
-      messages: [
-        {
-          role: "system",
-          content: `
-You are GigProfit AI, a smart, natural, human-sounding copilot for Uber and Lyft drivers.
-
-Your goals:
-- help drivers make better decisions
-- sound practical, warm, and sharp
-- avoid robotic phrasing
-- answer clearly and conversationally
-- focus on earnings, zones, timing, miles, and efficiency
-
-Rules:
-- do not use markdown tables
-- do not sound academic
-- do not over-explain
-- if the driver asks if a ride is good, evaluate it using pay, miles, minutes, dollars per mile, and dollars per hour if available
-- if the driver asks for advice, answer like a highly experienced rideshare strategist
-          `.trim(),
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
+      messages,
     });
 
-    const text = response.choices?.[0]?.message?.content ?? "No response";
-    res.json({ reply: text });
+    const text = response.choices?.[0]?.message?.content?.trim();
+
+    if (!text) {
+      return res.status(500).json({ error: "OpenAI returned empty content" });
+    }
+
+    return res.json({
+      reply: text,
+      mode,
+      source: "railway-v3-copilot",
+    });
   } catch (error) {
-    console.error("ASK ERROR:", error);
-    res.status(500).json({ error: "AI request failed" });
+    console.error("ASK ERROR FULL:", error);
+
+    return res.status(500).json({
+      error: "AI request failed",
+      details: error?.message || String(error),
+      source: "railway-v3-copilot",
+    });
   }
 });
 
@@ -516,6 +666,10 @@ Rules:
 
 app.post("/radar/recommend", async (req, res) => {
   try {
+    if (!hasOpenAIKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
+    }
+
     const {
       city = "Charlotte",
       latitude,
@@ -711,7 +865,144 @@ Recommendation:
     });
   } catch (error) {
     console.error("RADAR ERROR:", error);
-    res.status(500).json({ error: "Radar recommendation failed" });
+    res.status(500).json({
+      error: "Radar recommendation failed",
+      details: error?.message || String(error),
+    });
+  }
+});
+
+// --------------------------------------------------
+// OFFLINE STATE PACKS
+// --------------------------------------------------
+
+function getOfflineStatePack(stateCode = "NC") {
+  const code = String(stateCode || "NC").toUpperCase();
+
+  const statePacks = {
+    NC: {
+      stateCode: "NC",
+      stateName: "North Carolina",
+      majorCities: [
+        {
+          name: "Charlotte",
+          lat: 35.2271,
+          lon: -80.8431
+        },
+        {
+          name: "Raleigh",
+          lat: 35.7796,
+          lon: -78.6382
+        },
+        {
+          name: "Greensboro",
+          lat: 36.0726,
+          lon: -79.7920
+        }
+      ],
+      airports: [
+        {
+          name: "CLT Airport",
+          lat: 35.2144,
+          lon: -80.9473,
+          priority: "high"
+        },
+        {
+          name: "RDU Airport",
+          lat: 35.8801,
+          lon: -78.7880,
+          priority: "high"
+        }
+      ],
+      hotspots: [
+        {
+          name: "Uptown Charlotte",
+          type: "downtown",
+          lat: 35.2271,
+          lon: -80.8431,
+          expected: "$24-$36/hr"
+        },
+        {
+          name: "South End",
+          type: "nightlife",
+          lat: 35.2130,
+          lon: -80.8576,
+          expected: "$28-$40/hr"
+        },
+        {
+          name: "NoDa",
+          type: "nightlife",
+          lat: 35.2479,
+          lon: -80.8057,
+          expected: "$22-$34/hr"
+        }
+      ],
+      generatedAt: new Date().toISOString()
+    },
+
+    SC: {
+      stateCode: "SC",
+      stateName: "South Carolina",
+      majorCities: [
+        {
+          name: "Columbia",
+          lat: 34.0007,
+          lon: -81.0348
+        },
+        {
+          name: "Charleston",
+          lat: 32.7765,
+          lon: -79.9311
+        },
+        {
+          name: "Greenville",
+          lat: 34.8526,
+          lon: -82.3940
+        }
+      ],
+      airports: [
+        {
+          name: "CHS Airport",
+          lat: 32.8986,
+          lon: -80.0405,
+          priority: "high"
+        }
+      ],
+      hotspots: [
+        {
+          name: "Downtown Charleston",
+          type: "downtown",
+          lat: 32.7765,
+          lon: -79.9311,
+          expected: "$22-$34/hr"
+        }
+      ],
+      generatedAt: new Date().toISOString()
+    }
+  };
+
+  return statePacks[code] || statePacks["NC"];
+}
+
+app.get("/offline/state-pack", async (req, res) => {
+  try {
+    const state = req.query.state || "NC";
+
+    const pack = getOfflineStatePack(state);
+
+    return res.json({
+      ok: true,
+      source: "gigprofit-offline-pack",
+      pack
+    });
+  } catch (error) {
+    console.error("OFFLINE PACK ERROR:", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to generate offline state pack",
+      details: error?.message || String(error)
+    });
   }
 });
 
@@ -719,112 +1010,24 @@ Recommendation:
 // PLAID
 // --------------------------------------------------
 
-app.post("/plaid/create_link_token", async (req, res) => {
-  try {
-    if (!hasPlaidKeys) {
-      return res.status(500).json({
-        error: "Plaid keys are missing. Check PLAID_CLIENT_ID and PLAID_SECRET.",
-      });
-    }
-
-    const response = await plaidClient.linkTokenCreate({
-      user: {
-        client_user_id: `gigprofit-user-${Date.now()}`,
-      },
-      client_name: "GigProfit",
-      products: ["transactions"],
-      country_codes: ["US"],
-      language: "en",
-    });
-
-    res.json(response.data);
-  } catch (error) {
-    console.error(
-      "PLAID LINK TOKEN ERROR:",
-      error?.response?.data || error.message || error
-    );
-    res.status(500).json({
-      error: "Failed to create Plaid link token",
-      details: error?.response?.data || error.message || String(error),
-    });
-  }
-});
-
-app.post("/plaid/exchange_public_token", async (req, res) => {
-  try {
-    if (!hasPlaidKeys) {
-      return res.status(500).json({
-        error: "Plaid keys are missing. Check PLAID_CLIENT_ID and PLAID_SECRET.",
-      });
-    }
-
-    const { public_token } = req.body || {};
-
-    if (!public_token) {
-      return res.status(400).json({ error: "Missing public_token" });
-    }
-
-    const response = await plaidClient.itemPublicTokenExchange({
-      public_token,
-    });
-
-    res.json({
-      access_token: response.data.access_token,
-      item_id: response.data.item_id,
-    });
-  } catch (error) {
-    console.error(
-      "PLAID EXCHANGE ERROR:",
-      error?.response?.data || error.message || error
-    );
-    res.status(500).json({
-      error: "Failed to exchange public token",
-      details: error?.response?.data || error.message || String(error),
-    });
-  }
-});
-
-app.post("/plaid/transactions", async (req, res) => {
-  try {
-    if (!hasPlaidKeys) {
-      return res.status(500).json({
-        error: "Plaid keys are missing. Check PLAID_CLIENT_ID and PLAID_SECRET.",
-      });
-    }
-
-    const { access_token, start_date, end_date } = req.body || {};
-
-    if (!access_token) {
-      return res.status(400).json({ error: "Missing access_token" });
-    }
-
-    const response = await plaidClient.transactionsGet({
-      access_token,
-      start_date: start_date || "2024-01-01",
-      end_date: end_date || new Date().toISOString().split("T")[0],
-    });
-
-    res.json(response.data);
-  } catch (error) {
-    console.error(
-      "PLAID TRANSACTIONS ERROR:",
-      error?.response?.data || error.message || error
-    );
-    res.status(500).json({
-      error: "Failed to fetch transactions",
-      details: error?.response?.data || error.message || String(error),
-    });
-  }
-});
+app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
 
 // --------------------------------------------------
 // START
 // --------------------------------------------------
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`GigProfit backend listening on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Plaid env: ${PLAID_ENV_RAW}`);
-  console.log(`Plaid configured: ${hasPlaidKeys ? "yes" : "no"}`);
-  console.log(`OpenAI configured: ${hasOpenAIKey ? "yes" : "no"}`);
-});
+const currentModulePath = fileURLToPath(import.meta.url);
+const invokedPath = process.argv[1] || "";
+
+if (currentModulePath === invokedPath) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`GigProfit backend listening on port ${PORT}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+    console.log(`Plaid env: ${PLAID_ENV_RAW}`);
+    console.log(`Plaid configured: ${hasPlaidKeys ? "yes" : "no"}`);
+    console.log(`OpenAI configured: ${hasOpenAIKey ? "yes" : "no"}`);
+  });
+}
+
+export { app };
+        
