@@ -106,6 +106,29 @@ function mapTransaction(transaction, item) {
   };
 }
 
+function maskItemId(itemId) {
+  const value = String(itemId || "").trim();
+  if (value.length <= 8) {
+    return value || "unknown";
+  }
+
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function mapConnection(item) {
+  return {
+    item_id: item.itemId,
+    institution_name: item.institutionName || "Connected Bank",
+    connection_status: item.connectionStatus || "connected",
+    needs_update: Boolean(item.needsUpdate),
+    update_reason: item.updateReason || null,
+    new_accounts_available: Boolean(item.newAccountsAvailable),
+    needs_account_selection_update: Boolean(item.needsAccountSelectionUpdate),
+    updated_at: item.updatedAt?.toDate?.()?.toISOString?.() || null,
+    accounts: Array.isArray(item.accounts) ? item.accounts : [],
+  };
+}
+
 function statusPayload(items) {
   const latestItem = items
     .filter((item) => item.updatedAt)
@@ -119,13 +142,45 @@ function statusPayload(items) {
     connected: items.length > 0,
     item_id: items.length === 1 ? items[0].itemId : undefined,
     updated_at: latestItem?.updatedAt?.toDate?.()?.toISOString?.(),
-    connections: items.map((item) => ({
-      item_id: item.itemId,
-      institution_name: item.institutionName || "Connected Bank",
-      updated_at: item.updatedAt?.toDate?.()?.toISOString?.() || null,
-      accounts: Array.isArray(item.accounts) ? item.accounts : [],
-    })),
+    connections: items.map(mapConnection),
   };
+}
+
+function mapWebhookUpdate(webhookCode) {
+  switch (String(webhookCode || "").trim()) {
+    case "ITEM_LOGIN_REQUIRED":
+      return {
+        connectionStatus: "needs_reauth",
+        needsUpdate: true,
+        updateReason: "item_login_required",
+      };
+    case "PENDING_EXPIRATION":
+      return {
+        connectionStatus: "pending_expiration",
+        needsUpdate: true,
+        updateReason: "pending_expiration",
+      };
+    case "PENDING_DISCONNECT":
+      return {
+        connectionStatus: "pending_disconnect",
+        needsUpdate: true,
+        updateReason: "pending_disconnect",
+      };
+    case "LOGIN_REPAIRED":
+      return {
+        connectionStatus: "connected",
+        needsUpdate: false,
+        updateReason: null,
+        repairedAt: "SERVER_TIMESTAMP",
+      };
+    case "NEW_ACCOUNTS_AVAILABLE":
+      return {
+        newAccountsAvailable: true,
+        needsAccountSelectionUpdate: true,
+      };
+    default:
+      return null;
+  }
 }
 
 function ensurePlaidSecretsReady(hasPlaidKeys, encryptionKey, res) {
@@ -158,8 +213,84 @@ export function createPlaidRouter({
   encryptSecret,
   decryptSecret,
   nodeEnv,
+  plaidWebhookUrl,
+  admin,
 }) {
   const router = express.Router();
+
+  router.post("/webhook", async (req, res) => {
+    const webhookType = String(req.body?.webhook_type || "").trim();
+    const webhookCode = String(req.body?.webhook_code || "").trim();
+    const itemId = String(req.body?.item_id || "").trim();
+    const maskedItemId = maskItemId(itemId);
+
+    if (webhookType !== "ITEM" || !webhookCode || !itemId) {
+      console.info("PLAID WEBHOOK IGNORED", {
+        webhook_type: webhookType || null,
+        webhook_code: webhookCode || null,
+        item_id: maskedItemId,
+        result: "ignored",
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    const mapped = mapWebhookUpdate(webhookCode);
+    if (!mapped) {
+      console.info("PLAID WEBHOOK IGNORED", {
+        webhook_type: webhookType,
+        webhook_code: webhookCode,
+        item_id: maskedItemId,
+        result: "unsupported_code",
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    try {
+      const owner = await store.findItemOwner(itemId);
+
+      if (!owner) {
+        console.info("PLAID WEBHOOK PROCESSED", {
+          webhook_type: webhookType,
+          webhook_code: webhookCode,
+          item_id: maskedItemId,
+          result: "item_not_found",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      const webhookState = {
+        lastWebhookType: webhookType,
+        lastWebhookCode: webhookCode,
+        lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...mapped,
+      };
+
+      if (webhookCode === "LOGIN_REPAIRED") {
+        webhookState.newAccountsAvailable = false;
+        webhookState.needsAccountSelectionUpdate = false;
+        webhookState.repairedAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+
+      await store.updateItemState(owner.uid, itemId, webhookState);
+
+      console.info("PLAID WEBHOOK PROCESSED", {
+        webhook_type: webhookType,
+        webhook_code: webhookCode,
+        item_id: maskedItemId,
+        result: "updated",
+      });
+      return res.status(200).json({ ok: true });
+    } catch (error) {
+      console.error("PLAID WEBHOOK ERROR", {
+        webhook_type: webhookType,
+        webhook_code: webhookCode,
+        item_id: maskedItemId,
+        result: "failed",
+        message: error?.message || "Unknown error",
+      });
+      return res.status(200).json({ ok: true });
+    }
+  });
 
   router.use(requireFirebaseAuth);
 
@@ -239,6 +370,10 @@ export function createPlaidRouter({
         itemId,
         environment: plaidEnvironment,
         connectionStatus: "connected",
+        needsUpdate: false,
+        updateReason: null,
+        newAccountsAvailable: false,
+        needsAccountSelectionUpdate: false,
         institutionName,
         accounts: (accountsResponse.data.accounts || []).map(mapStoredAccount),
       });
@@ -367,6 +502,85 @@ export function createPlaidRouter({
         ok: false,
         error: clientErrorMessage(
           "Failed to read bank connection status.",
+          nodeEnv,
+          error
+        ),
+      });
+    }
+  });
+
+  router.post("/items/:itemId/update-link-token", async (req, res) => {
+    try {
+      if (!ensurePlaidSecretsReady(hasPlaidKeys, encryptionKey, res)) {
+        return;
+      }
+
+      if ("access_token" in (req.body || {})) {
+        return res.status(400).json({
+          ok: false,
+          error: "access_token must not be sent by the client.",
+        });
+      }
+
+      const itemId = String(req.params?.itemId || "").trim();
+      const item = await store.getItem(req.auth.uid, itemId);
+
+      if (!item) {
+        return res.status(404).json({
+          ok: false,
+          error: "The requested Plaid connection was not found.",
+        });
+      }
+
+      const requestedAccountSelection = req.body?.account_selection_enabled;
+      const hasAccountSelectionFlag =
+        Object.prototype.hasOwnProperty.call(req.body || {}, "account_selection_enabled");
+
+      if (
+        hasAccountSelectionFlag &&
+        typeof requestedAccountSelection !== "boolean"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "account_selection_enabled must be a boolean.",
+        });
+      }
+
+      const accountSelectionEnabled = Boolean(requestedAccountSelection);
+      const accessToken = decryptSecret(item, encryptionKey);
+      const request = {
+        user: {
+          client_user_id: `gigprofit:${req.auth.uid}`,
+        },
+        client_name: "GigProfit",
+        country_codes: ["US"],
+        language: "en",
+        access_token: accessToken,
+      };
+
+      if (plaidWebhookUrl) {
+        request.webhook = plaidWebhookUrl;
+      }
+
+      if (accountSelectionEnabled) {
+        request.update = {
+          account_selection_enabled: true,
+        };
+      }
+
+      const response = await plaidClient.linkTokenCreate(request);
+
+      return res.json({
+        link_token: response.data.link_token,
+        expiration: response.data.expiration,
+        request_id: response.data.request_id,
+      });
+    } catch (error) {
+      console.error("PLAID UPDATE LINK TOKEN ERROR", safeErrorLog(error));
+      return res.status(500).json({
+        ok: false,
+        error: clientErrorMessage(
+          "Failed to prepare the bank update flow.",
           nodeEnv,
           error
         ),

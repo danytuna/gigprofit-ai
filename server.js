@@ -125,6 +125,10 @@ const plaidRouter = createPlaidRouter({
   encryptSecret,
   decryptSecret,
   nodeEnv: NODE_ENV,
+  plaidWebhookUrl:
+    process.env.PLAID_WEBHOOK_URL ||
+    "https://gigprofit-ai-production.up.railway.app/plaid/webhook",
+  admin: firebaseAdminServices.admin,
 });
 
 // --------------------------------------------------

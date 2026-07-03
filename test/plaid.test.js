@@ -44,6 +44,36 @@ function makeMemoryStore(seed = {}) {
         (records.get(uid) || []).filter((item) => item.itemId !== itemId)
       );
     },
+
+    async findItemOwner(itemId) {
+      for (const [uid, items] of records.entries()) {
+        const item = items.find((entry) => entry.itemId === itemId);
+        if (item) {
+          return {
+            uid,
+            item: { ...item },
+          };
+        }
+      }
+
+      return null;
+    },
+
+    async updateItemState(uid, itemId, updates) {
+      const items = records.get(uid) || [];
+      const index = items.findIndex((item) => item.itemId === itemId);
+
+      if (index === -1) {
+        return false;
+      }
+
+      items[index] = {
+        ...items[index],
+        ...updates,
+      };
+      records.set(uid, items);
+      return true;
+    },
   };
 }
 
@@ -75,6 +105,16 @@ function createTestRouter({ store, plaidClient }) {
     encryptSecret,
     decryptSecret,
     nodeEnv: "test",
+    plaidWebhookUrl: "https://gigprofit-ai-production.up.railway.app/plaid/webhook",
+    admin: {
+      firestore: {
+        FieldValue: {
+          serverTimestamp() {
+            return "SERVER_TIMESTAMP";
+          },
+        },
+      },
+    },
   });
 }
 
@@ -346,4 +386,240 @@ test("transactions reject client-sent access_token and filter by authenticated u
   assert.equal(filtered.body.transactions[0].transaction_id, "tx-a2");
   assert.equal(filtered.body.transactions[0].item_id, "item-a2");
   assert.equal(filtered.body.transactions[0].institution_name, "Bravo Bank");
+});
+
+test("webhook updates item state for required Plaid update mode events", async () => {
+  const store = makeMemoryStore({
+    "user-a": [
+      {
+        itemId: "item-a1",
+        institutionName: "Alpha Bank",
+        connectionStatus: "connected",
+        needsUpdate: false,
+        newAccountsAvailable: false,
+        needsAccountSelectionUpdate: false,
+      },
+    ],
+  });
+
+  const router = createTestRouter({ store, plaidClient: {} });
+
+  const loginRequired = await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "ITEM_LOGIN_REQUIRED",
+      item_id: "item-a1",
+    },
+  });
+
+  assert.equal(loginRequired.statusCode, 200);
+  assert.equal((await store.getItem("user-a", "item-a1")).needsUpdate, true);
+  assert.equal((await store.getItem("user-a", "item-a1")).updateReason, "item_login_required");
+
+  await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "PENDING_EXPIRATION",
+      item_id: "item-a1",
+    },
+  });
+  assert.equal((await store.getItem("user-a", "item-a1")).connectionStatus, "pending_expiration");
+
+  await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "PENDING_DISCONNECT",
+      item_id: "item-a1",
+    },
+  });
+  assert.equal((await store.getItem("user-a", "item-a1")).connectionStatus, "pending_disconnect");
+
+  await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "NEW_ACCOUNTS_AVAILABLE",
+      item_id: "item-a1",
+    },
+  });
+  assert.equal((await store.getItem("user-a", "item-a1")).newAccountsAvailable, true);
+  assert.equal((await store.getItem("user-a", "item-a1")).needsAccountSelectionUpdate, true);
+
+  await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "LOGIN_REPAIRED",
+      item_id: "item-a1",
+    },
+  });
+
+  const repaired = await store.getItem("user-a", "item-a1");
+  assert.equal(repaired.connectionStatus, "connected");
+  assert.equal(repaired.needsUpdate, false);
+  assert.equal(repaired.updateReason, null);
+  assert.equal(repaired.newAccountsAvailable, false);
+  assert.equal(repaired.needsAccountSelectionUpdate, false);
+});
+
+test("webhook safely ignores duplicates and unknown items", async () => {
+  const store = makeMemoryStore({
+    "user-a": [{ itemId: "item-a1", connectionStatus: "connected" }],
+  });
+  const router = createTestRouter({ store, plaidClient: {} });
+
+  const first = await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "ITEM_LOGIN_REQUIRED",
+      item_id: "item-a1",
+    },
+  });
+  const second = await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "ITEM_LOGIN_REQUIRED",
+      item_id: "item-a1",
+    },
+  });
+  const missing = await invokeRouter(router, {
+    method: "POST",
+    url: "/webhook",
+    body: {
+      webhook_type: "ITEM",
+      webhook_code: "ITEM_LOGIN_REQUIRED",
+      item_id: "missing-item",
+    },
+  });
+
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(missing.statusCode, 200);
+  assert.equal((await store.getItem("user-a", "item-a1")).needsUpdate, true);
+});
+
+test("update-link-token requires auth, enforces ownership, validates boolean flag, and hides access_token", async () => {
+  const key = resolveEncryptionKey({
+    envValue: makeBase64Key(),
+    nodeEnv: "test",
+  });
+
+  const store = makeMemoryStore({
+    "user-a": [
+      {
+        ...encryptSecret("token-a1", key),
+        itemId: "item-a1",
+        institutionName: "Alpha Bank",
+      },
+    ],
+  });
+
+  let receivedAccessToken = null;
+  let receivedUpdate = null;
+  const router = createTestRouter({
+    store,
+    plaidClient: {
+      async linkTokenCreate(payload) {
+        receivedAccessToken = payload.access_token;
+        receivedUpdate = payload.update || null;
+        return {
+          data: {
+            link_token: "update-link-token",
+            expiration: "2026-07-03T00:00:00Z",
+            request_id: "req-123",
+          },
+        };
+      },
+    },
+  });
+
+  const unauthorized = await invokeRouter(router, {
+    method: "POST",
+    url: "/items/item-a1/update-link-token",
+  });
+  assert.equal(unauthorized.statusCode, 401);
+
+  const forbidden = await invokeRouter(router, {
+    method: "POST",
+    url: "/items/item-a1/update-link-token",
+    headers: {
+      authorization: "Bearer valid-user-b",
+    },
+  });
+  assert.equal(forbidden.statusCode, 404);
+
+  const invalidFlag = await invokeRouter(router, {
+    method: "POST",
+    url: "/items/item-a1/update-link-token",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+    body: {
+      account_selection_enabled: "yes",
+    },
+  });
+  assert.equal(invalidFlag.statusCode, 400);
+
+  const success = await invokeRouter(router, {
+    method: "POST",
+    url: "/items/item-a1/update-link-token",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+    body: {
+      account_selection_enabled: true,
+    },
+  });
+
+  assert.equal(success.statusCode, 200);
+  assert.equal(success.body.link_token, "update-link-token");
+  assert.equal(success.body.request_id, "req-123");
+  assert.equal("access_token" in success.body, false);
+  assert.equal(receivedAccessToken, "token-a1");
+  assert.deepEqual(receivedUpdate, { account_selection_enabled: true });
+});
+
+test("status includes update mode flags", async () => {
+  const store = makeMemoryStore({
+    "user-a": [
+      {
+        itemId: "item-a1",
+        institutionName: "Alpha Bank",
+        connectionStatus: "needs_reauth",
+        needsUpdate: true,
+        updateReason: "item_login_required",
+        newAccountsAvailable: true,
+        needsAccountSelectionUpdate: true,
+        accounts: [],
+      },
+    ],
+  });
+
+  const router = createTestRouter({ store, plaidClient: {} });
+  const response = await invokeRouter(router, {
+    method: "GET",
+    url: "/status",
+    headers: {
+      authorization: "Bearer valid-user-a",
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.connections[0].connection_status, "needs_reauth");
+  assert.equal(response.body.connections[0].needs_update, true);
+  assert.equal(response.body.connections[0].update_reason, "item_login_required");
+  assert.equal(response.body.connections[0].new_accounts_available, true);
+  assert.equal(response.body.connections[0].needs_account_selection_update, true);
 });
