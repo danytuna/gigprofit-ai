@@ -9,6 +9,7 @@ import { createRequireFirebaseAuth } from "./requireFirebaseAuth.js";
 import { resolveEncryptionKey, encryptSecret, decryptSecret } from "./plaidCrypto.js";
 import { createPlaidStore } from "./plaidStore.js";
 import { createPlaidRouter } from "./plaidRouter.js";
+import { createAskHandler } from "./aiCopilot.js";
 
 dotenv.config();
 
@@ -97,6 +98,8 @@ const plaidStore = createPlaidStore(
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  timeout: 30_000,
+  maxRetries: 0,
 });
 
 // --------------------------------------------------
@@ -589,117 +592,11 @@ app.post("/community/report", (req, res) => {
 // AI ASSISTANT
 // --------------------------------------------------
 
-app.post("/ask", async (req, res) => {
-  try {
-    if (!hasOpenAIKey) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
-    }
-
-    const {
-      prompt,
-      context = "",
-      mode = "general",
-      conversation = [],
-    } = req.body || {};
-
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "Missing prompt" });
-    }
-
-    console.log("ASK HIT ✅");
-    console.log("Mode:", mode);
-    console.log("Prompt preview:", prompt.slice(0, 180));
-
-    const systemPrompt = `
-You are GigProfit AI, a smart and natural copilot for Uber and Lyft drivers using the GigProfit app.
-
-Your job:
-- help drivers make better earning decisions
-- explain things clearly and naturally
-- sound practical, confident, and human
-- avoid robotic or overly polished language
-- adapt to the user's request based on mode
-
-Modes:
-- general: answer normally
-- app_help: explain how to use GigProfit features clearly
-- ride_analysis: analyze rides using pay, miles, time, dollars per mile, and dollars per hour
-- tax_help: help with business expense, mileage, and tax organization
-- radar_help: help interpret zones, events, and move decisions
-
-Rules:
-- no markdown tables
-- no academic tone
-- no unnecessary disclaimers
-- keep answers structured but natural
-- if information is missing, say what is missing
-- if comparing rides, evaluate value, efficiency, and time cost
-- if helping with the app, explain step by step when useful
-- if the request is unclear, ask one short clarifying question
-`.trim();
-
-    const messages = [
-      {
-        role: "system",
-        content: systemPrompt,
-      },
-    ];
-
-    if (context && typeof context === "string" && context.trim()) {
-      messages.push({
-        role: "system",
-        content: `App context:\n${context.trim()}`,
-      });
-    }
-
-    if (Array.isArray(conversation)) {
-      for (const item of conversation.slice(-8)) {
-        if (
-          item &&
-          (item.role === "user" || item.role === "assistant") &&
-          typeof item.content === "string" &&
-          item.content.trim()
-        ) {
-          messages.push({
-            role: item.role,
-            content: item.content.trim(),
-          });
-        }
-      }
-    }
-
-    messages.push({
-      role: "user",
-      content: `Mode: ${mode}\n\nUser request:\n${prompt}`,
-    });
-
-    const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages,
-    });
-
-    const text = response.choices?.[0]?.message?.content?.trim();
-
-    if (!text) {
-      return res.status(500).json({ error: "OpenAI returned empty content" });
-    }
-
-    return res.json({
-      reply: text,
-      mode,
-      source: "railway-v3-copilot",
-    });
-  } catch (error) {
-    console.error("ASK ERROR FULL:", error);
-
-    return res.status(500).json({
-      error: "AI request failed",
-      details: error?.message || String(error),
-      source: "railway-v3-copilot",
-    });
-  }
-});
+app.post("/ask", createAskHandler({
+  openaiClient: client,
+  hasOpenAIKey,
+  logger: console,
+}));
 
 // --------------------------------------------------
 // RADAR
