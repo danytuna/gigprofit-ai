@@ -167,6 +167,115 @@ const taxRouter = createTaxRouter({
   config: taxConfig,
 });
 
+async function deleteCollectionDocuments(collectionRef) {
+  const snapshot = await collectionRef.get();
+
+  if (snapshot.empty) {
+    return 0;
+  }
+
+  const batch = firebaseAdminServices.firestore.batch();
+  snapshot.docs.forEach((doc) => {
+    batch.delete(doc.ref);
+  });
+  await batch.commit();
+  return snapshot.size;
+}
+
+async function deleteConversationTree(uid) {
+  const conversationsRef = firebaseAdminServices.firestore
+    .collection("users")
+    .doc(uid)
+    .collection("aiConversations");
+  const conversationsSnapshot = await conversationsRef.get();
+  let deleted = 0;
+
+  for (const conversationDoc of conversationsSnapshot.docs) {
+    const messagesRef = conversationDoc.ref.collection("messages");
+    await deleteCollectionDocuments(messagesRef);
+    await conversationDoc.ref.delete().catch(() => {});
+    deleted += 1;
+  }
+
+  return deleted;
+}
+
+async function runAccountDeletion(uid) {
+  const userRef = firebaseAdminServices.firestore
+    .collection("users")
+    .doc(uid);
+  const result = {
+    plaidItemsRemoved: 0,
+    plaidItemRemoveAttempts: 0,
+    aiConversationsDeleted: 0,
+    aiMemoriesDeleted: 0,
+    taxTransactionsDeleted: 0,
+    taxRulesDeleted: 0,
+    taxReviewsDeleted: 0,
+    radarObservationsDeleted: 0,
+    radarSessionsDeleted: 0,
+    userDocumentDeleted: false,
+    privateIntegrationRootDeleted: false,
+  };
+
+  const plaidItems = await plaidStore.getItems(uid);
+  for (const item of plaidItems) {
+    result.plaidItemRemoveAttempts += 1;
+
+    try {
+      const accessToken = decryptSecret(item, plaidEncryptionKey);
+      await plaidClient.itemRemove({
+        access_token: accessToken,
+      });
+    } catch (error) {
+      const plaidCode = error?.response?.data?.error_code || error?.code || null;
+      if (plaidCode !== "ITEM_NOT_FOUND") {
+        throw error;
+      }
+    }
+  }
+
+  result.plaidItemsRemoved = await plaidStore.deleteAllItems(uid);
+
+  await userRef
+    .collection("privateIntegrations")
+    .doc("plaid")
+    .delete()
+    .then(() => {
+      result.privateIntegrationRootDeleted = true;
+    })
+    .catch(() => {
+      result.privateIntegrationRootDeleted = false;
+    });
+
+  const aiDeleted = await aiCopilotStore.deleteAllAIData(uid);
+  result.aiConversationsDeleted = Number(aiDeleted?.conversations || 0);
+  result.aiMemoriesDeleted = Number(aiDeleted?.memories || 0);
+
+  result.taxTransactionsDeleted = await deleteCollectionDocuments(
+    userRef.collection("taxTransactions")
+  );
+  result.taxRulesDeleted = await taxStore.clearRules(uid);
+  result.taxReviewsDeleted = await deleteCollectionDocuments(
+    userRef.collection("taxAiReviews")
+  );
+  result.radarObservationsDeleted = await deleteCollectionDocuments(
+    userRef.collection("radarObservations")
+  );
+  result.radarSessionsDeleted = await deleteCollectionDocuments(
+    userRef.collection("radarSessions")
+  );
+  await deleteCollectionDocuments(
+    userRef.collection("aiProfile")
+  );
+  await deleteConversationTree(uid);
+
+  await userRef.delete().catch(() => {});
+  result.userDocumentDeleted = true;
+
+  return result;
+}
+
 // --------------------------------------------------
 // COMMUNITY REPORTS (memory-only v1)
 // --------------------------------------------------
@@ -976,6 +1085,30 @@ app.get("/offline/state-pack", async (req, res) => {
 // --------------------------------------------------
 // PLAID
 // --------------------------------------------------
+
+app.delete("/account", requireFirebaseAuth, async (req, res) => {
+  try {
+    const result = await runAccountDeletion(req.auth.uid);
+    return res.json({
+      ok: true,
+      deleted: true,
+      result,
+    });
+  } catch (error) {
+    console.error("ACCOUNT_DELETE_ERROR", {
+      uid: req.auth.uid,
+      message: error?.message || "unknown",
+      code: error?.code || error?.response?.data?.error_code || null,
+      status: error?.status || error?.response?.status || null,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: "Account deletion failed",
+      message: "GigProfit could not finish deleting this account right now. Please try again.",
+    });
+  }
+});
 
 app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
 app.use("/ai", requireFirebaseAuth, aiCopilotRouterBundle.router);
