@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import express from "express";
 
 import { createOpenAIClient } from "../aiCopilot.js";
 import {
   buildConfigFromEnv,
+  buildResponsesCreateParams,
   createLegacyAskHandler,
+  createAICopilotRouter,
   detectExplicitMemoryCommand,
   evaluateOfferTool,
   extractMemoryCandidates,
   filterAutoMemories,
   generateConversationTitle,
+  getModelCapabilities,
   inferLanguage,
   processConversationAsk,
   sanitizeGigProfitContext,
@@ -65,6 +69,18 @@ function makeOpenAIClient(handler) {
     responses: {
       create: handler,
     },
+  };
+}
+
+async function startTestServer(app) {
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+
+  const address = server.address();
+  return {
+    server,
+    url: `http://127.0.0.1:${address.port}`,
   };
 }
 
@@ -205,6 +221,40 @@ test("processConversationAsk preserves tool names across Responses API tool turn
   assert.deepEqual(result.body.metadata.toolNames, ["get_recent_orders_summary"]);
 });
 
+test("buildResponsesCreateParams omits reasoning and verbosity for models without support", () => {
+  const params = buildResponsesCreateParams({
+    model: "gpt-4.1-mini",
+    input: [{ role: "user", content: "Hi" }],
+    tools: [],
+  });
+
+  assert.equal(params.model, "gpt-4.1-mini");
+  assert.equal(params.reasoning, undefined);
+  assert.equal(params.text, undefined);
+  assert.ok(!("tools" in params));
+});
+
+test("buildResponsesCreateParams includes reasoning and verbosity only for supported models", () => {
+  const params = buildResponsesCreateParams({
+    model: "gpt-5-mini",
+    input: [{ role: "user", content: "Hi" }],
+    tools: [{ type: "function", name: "test_tool" }],
+    previousResponseId: "resp_123",
+  });
+
+  assert.deepEqual(params.reasoning, { effort: "medium" });
+  assert.deepEqual(params.text, { verbosity: "medium" });
+  assert.deepEqual(params.tools, [{ type: "function", name: "test_tool" }]);
+  assert.equal(params.previous_response_id, "resp_123");
+});
+
+test("model capability detection stays conservative for gpt-4.1-mini", () => {
+  assert.deepEqual(getModelCapabilities("gpt-4.1-mini"), {
+    supportsReasoning: false,
+    supportsVerbosity: false,
+  });
+});
+
 test("legacy ask handler does not return technical errors to the client", async () => {
   const config = makeConfig();
   const store = makeStore(config);
@@ -239,6 +289,141 @@ test("legacy ask handler does not return technical errors to the client", async 
     message: "GigProfit AI is temporarily unavailable. Please try again.",
   });
   assert.doesNotMatch(JSON.stringify(res.body), /top secret|transport/i);
+});
+
+test("unsupported_parameter 400 is not retried and logs only safe fields", async () => {
+  const config = makeConfig({ model: "gpt-4.1-mini" });
+  const store = makeStore(config);
+  const logger = makeLogger();
+  const conversation = await store.createConversation("user-a", {});
+  let attempts = 0;
+  const openaiClient = makeOpenAIClient(async () => {
+    attempts += 1;
+    const error = new Error("should stay private");
+    error.status = 400;
+    error.code = "unsupported_parameter";
+    error.param = "text.verbosity";
+    error.request_id = "req_123";
+    throw error;
+  });
+
+  const result = await processConversationAsk({
+    store,
+    openaiClient,
+    logger,
+    uid: "user-a",
+    conversationId: conversation.id,
+    question: "top secret prompt",
+    appContext: {},
+    plan: "free",
+    config,
+    persist: true,
+  });
+
+  assert.equal(attempts, 1);
+  assert.equal(result.status, 503);
+  assert.deepEqual(result.body, {
+    error: "AI temporarily unavailable",
+    message: "GigProfit AI is temporarily unavailable. Please try again.",
+  });
+  assert.deepEqual(logger.entries.at(-1), {
+    level: "error",
+    message: "AI CONVERSATION ERROR",
+    payload: {
+      code: "unsupported_parameter",
+      status: 400,
+      param: "text.verbosity",
+      model: "gpt-4.1-mini",
+      requestId: "req_123",
+      attempt: 1,
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(logger.entries), /top secret prompt|should stay private/i);
+});
+
+test("transient AI transport errors are still retried", async () => {
+  const config = makeConfig({ model: "gpt-4.1-mini" });
+  const store = makeStore(config);
+  const logger = makeLogger();
+  const conversation = await store.createConversation("user-a", {});
+  let attempts = 0;
+  const openaiClient = makeOpenAIClient(async () => {
+    attempts += 1;
+
+    if (attempts < 3) {
+      const error = new Error("fetch failed");
+      error.code = "ERR_STREAM_PREMATURE_CLOSE";
+      throw error;
+    }
+
+    return {
+      id: "resp_retry_success",
+      output_text: "Recovered answer",
+      output: [],
+      usage: {
+        input_tokens: 11,
+        output_tokens: 5,
+        total_tokens: 16,
+      },
+    };
+  });
+
+  const result = await processConversationAsk({
+    store,
+    openaiClient,
+    logger,
+    uid: "user-a",
+    conversationId: conversation.id,
+    question: "Need a retry",
+    appContext: {},
+    plan: "free",
+    config,
+    persist: true,
+  });
+
+  assert.equal(attempts, 3);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.reply, "Recovered answer");
+});
+
+test("x-forwarded-for works behind a trusted Railway proxy without rate limiter errors", async () => {
+  const config = makeConfig({ model: "gpt-4.1-mini" });
+  const store = makeStore(config);
+  const logger = makeLogger();
+  const app = express();
+  app.set("trust proxy", 1);
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.auth = { uid: "user-a" };
+    next();
+  });
+  app.use("/ai", createAICopilotRouter({
+    store,
+    openaiClient: makeOpenAIClient(async () => ({
+      id: "resp_profile",
+      output_text: "ok",
+      output: [],
+    })),
+    logger,
+    config,
+  }).router);
+
+  const { server, url } = await startTestServer(app);
+
+  try {
+    const response = await fetch(`${url}/ai/profile`, {
+      headers: {
+        "X-Forwarded-For": "203.0.113.10",
+      },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(logger.entries.some((entry) => JSON.stringify(entry).includes("ERR_ERL_UNEXPECTED_X_FORWARDED_FOR")), false);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
 });
 
 test("memory commands perform real memory operations", async () => {

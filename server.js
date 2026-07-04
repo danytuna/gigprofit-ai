@@ -16,6 +16,7 @@ dotenv.config();
 
 const app = express();
 const NODE_ENV = process.env.NODE_ENV || "development";
+app.set("trust proxy", NODE_ENV === "production" ? 1 : false);
 
 function validateRequiredEnvironment({
   nodeEnv,

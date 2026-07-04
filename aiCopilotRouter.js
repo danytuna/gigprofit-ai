@@ -848,6 +848,80 @@ function listFunctionCalls(response) {
   return (response?.output || []).filter((item) => item?.type === "function_call");
 }
 
+function normalizeModelName(model) {
+  return String(model || "")
+    .trim()
+    .toLowerCase();
+}
+
+function getModelCapabilities(model) {
+  const normalized = normalizeModelName(model);
+  const supportsVerbosity =
+    normalized.startsWith("gpt-5") ||
+    normalized.startsWith("gpt-5-mini") ||
+    normalized.startsWith("gpt-5-nano");
+  const supportsReasoning =
+    supportsVerbosity ||
+    normalized.startsWith("o1") ||
+    normalized.startsWith("o3") ||
+    normalized.startsWith("o4");
+
+  return {
+    supportsReasoning,
+    supportsVerbosity,
+  };
+}
+
+function stripEmptyValues(value) {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) => stripEmptyValues(item))
+      .filter((item) => item !== undefined);
+
+    return items.length ? items : undefined;
+  }
+
+  if (typeof value === "object") {
+    const entries = Object.entries(value)
+      .map(([key, item]) => [key, stripEmptyValues(item)])
+      .filter(([, item]) => item !== undefined);
+
+    if (!entries.length) {
+      return undefined;
+    }
+
+    return Object.fromEntries(entries);
+  }
+
+  return value;
+}
+
+function buildResponsesCreateParams({
+  model,
+  input,
+  tools,
+  previousResponseId,
+}) {
+  const capabilities = getModelCapabilities(model);
+
+  return stripEmptyValues({
+    model,
+    input,
+    previous_response_id: previousResponseId,
+    tools,
+    reasoning: capabilities.supportsReasoning
+      ? { effort: "medium" }
+      : undefined,
+    text: capabilities.supportsVerbosity
+      ? { verbosity: "medium" }
+      : undefined,
+  });
+}
+
 async function runResponsesTurn({
   openaiClient,
   model,
@@ -877,13 +951,11 @@ async function runResponsesTurn({
   ];
 
   const executeTool = createToolExecutor();
-  let response = await openaiClient.responses.create({
+  let response = await openaiClient.responses.create(buildResponsesCreateParams({
     model,
     input,
     tools,
-    reasoning: { effort: "medium" },
-    text: { verbosity: "medium" },
-  });
+  }));
 
   for (let iteration = 0; iteration < 4; iteration += 1) {
     const functionCalls = listFunctionCalls(response);
@@ -912,14 +984,12 @@ async function runResponsesTurn({
       };
     });
 
-    response = await openaiClient.responses.create({
+    response = await openaiClient.responses.create(buildResponsesCreateParams({
       model,
-      previous_response_id: response.id,
+      previousResponseId: response.id,
       input: toolOutputs,
       tools,
-      reasoning: { effort: "medium" },
-      text: { verbosity: "medium" },
-    });
+    }));
   }
 
   const outputText = extractOutputText(response);
@@ -959,6 +1029,12 @@ function normalizeRequestId(error) {
   return null;
 }
 
+function normalizeErrorParam(error) {
+  if (typeof error?.param === "string" && error.param) return error.param;
+  if (typeof error?.error?.param === "string" && error.error.param) return error.error.param;
+  return null;
+}
+
 function isRetryableError(error) {
   const status = normalizeStatus(error);
   if ([400, 401, 403].includes(status)) return false;
@@ -985,6 +1061,8 @@ async function requestResponsesWithRetry(options) {
       options.logger.error("AI CONVERSATION ERROR", {
         code: normalizeErrorCode(error),
         status: normalizeStatus(error),
+        param: normalizeErrorParam(error),
+        model: options.model,
         requestId: normalizeRequestId(error),
         attempt,
       });
@@ -1637,6 +1715,7 @@ function createAICopilotRouter({
 export {
   buildConfigFromEnv,
   buildContextWindow,
+  buildResponsesCreateParams,
   createAICopilotRateLimiter,
   createAICopilotRouter,
   createLegacyAskHandler,
@@ -1646,6 +1725,7 @@ export {
   extractMemoryCandidates,
   filterAutoMemories,
   generateConversationTitle,
+  getModelCapabilities,
   inferLanguage,
   processConversationAsk,
   sanitizeGigProfitContext,
