@@ -8,7 +8,9 @@ import { createRequireFirebaseAuth } from "./requireFirebaseAuth.js";
 import { resolveEncryptionKey, encryptSecret, decryptSecret } from "./plaidCrypto.js";
 import { createPlaidStore } from "./plaidStore.js";
 import { createPlaidRouter } from "./plaidRouter.js";
-import { createAskHandler, createOpenAIClient } from "./aiCopilot.js";
+import { createOpenAIClient } from "./aiCopilot.js";
+import { createAICopilotStore } from "./aiCopilotStore.js";
+import { buildConfigFromEnv, createAICopilotRouter } from "./aiCopilotRouter.js";
 
 dotenv.config();
 
@@ -90,6 +92,12 @@ const plaidStore = createPlaidStore(
   firebaseAdminServices.firestore,
   firebaseAdminServices.admin
 );
+const aiCopilotConfig = buildConfigFromEnv(process.env);
+const aiCopilotStore = createAICopilotStore({
+  firestore: firebaseAdminServices.firestore,
+  admin: firebaseAdminServices.admin,
+  config: aiCopilotConfig,
+});
 
 // --------------------------------------------------
 // OPENAI
@@ -99,6 +107,13 @@ const client = createOpenAIClient({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: 30_000,
   logger: console,
+});
+const aiCopilotRouterBundle = createAICopilotRouter({
+  store: aiCopilotStore,
+  openaiClient: client,
+  hasOpenAIKey,
+  logger: console,
+  config: aiCopilotConfig,
 });
 
 // --------------------------------------------------
@@ -591,11 +606,7 @@ app.post("/community/report", (req, res) => {
 // AI ASSISTANT
 // --------------------------------------------------
 
-app.post("/ask", createAskHandler({
-  openaiClient: client,
-  hasOpenAIKey,
-  logger: console,
-}));
+app.post("/ask", aiCopilotRouterBundle.legacyAskHandler);
 
 // --------------------------------------------------
 // RADAR
@@ -948,6 +959,7 @@ app.get("/offline/state-pack", async (req, res) => {
 // --------------------------------------------------
 
 app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
+app.use("/ai", requireFirebaseAuth, aiCopilotRouterBundle.router);
 
 // --------------------------------------------------
 // START
