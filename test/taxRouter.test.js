@@ -6,6 +6,7 @@ import { createTaxStore } from "../taxStore.js";
 import {
   buildPlaidTransactionsGetRequest,
   buildPlaidTransactionsSyncRequest,
+  buildTaxCenterCounts,
   buildReviewResponse,
   createTaxRouter,
 } from "../taxRouter.js";
@@ -408,6 +409,86 @@ test("review response contract always includes suggestions arrays and count fiel
   assert.deepEqual(review.suggestions, []);
   assert.equal(review.suggestionCount, 0);
   assert.equal(review.transactionCount, 12);
+});
+
+test("tax center counts keep manual review, AI eligible, and saved suggestions separate", () => {
+  const review = {
+    id: "review-1",
+    year: 2026,
+    status: "processing",
+    progress: {
+      total: 7,
+    },
+    suggestions: [
+      {
+        transactionId: "tx-ai",
+        classification: "business",
+        deductibility: "deductible",
+      },
+    ],
+  };
+  const counts = buildTaxCenterCounts([
+    {
+      id: "tx-confirmed-business",
+      isIncome: false,
+      userConfirmed: true,
+      classification: "business",
+      classificationSource: "manual",
+    },
+    {
+      id: "tx-confirmed-personal",
+      isIncome: false,
+      userConfirmed: true,
+      classification: "personal",
+      classificationSource: "manual",
+    },
+    {
+      id: "tx-manual-review",
+      isIncome: false,
+      userConfirmed: false,
+      classification: "needs_review",
+      classificationSource: "manual",
+    },
+    {
+      id: "tx-ai-eligible",
+      isIncome: false,
+      userConfirmed: false,
+      classification: "business",
+      classificationSource: "imported",
+    },
+    {
+      id: "tx-ai-suggested",
+      isIncome: false,
+      userConfirmed: false,
+      classification: "business",
+      classificationSource: "ai_suggestion",
+    },
+    {
+      id: "tx-excluded",
+      isIncome: false,
+      userConfirmed: false,
+      classification: "excluded",
+      classificationSource: "manual",
+    },
+    {
+      id: "tx-income",
+      isIncome: true,
+      userConfirmed: true,
+      classification: "business",
+      classificationSource: "manual",
+    },
+  ], review);
+
+  assert.equal(counts.totalTransactions, 6);
+  assert.equal(counts.unreviewedTransactionCount, 4);
+  assert.equal(counts.manualReviewCount, 1);
+  assert.equal(counts.aiEligibleTransactionCount, 2);
+  assert.equal(counts.aiReviewProcessingCount, 7);
+  assert.equal(counts.aiSuggestionCount, 1);
+  assert.equal(counts.unappliedAiSuggestionCount, 1);
+  assert.equal(counts.confirmedBusinessCount, 1);
+  assert.equal(counts.confirmedPersonalCount, 1);
+  assert.equal(counts.excludedCount, 1);
 });
 
 test("user A cannot access user B tax transactions", async () => {

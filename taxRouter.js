@@ -220,7 +220,7 @@ function buildTransactionResponse(record) {
   });
 }
 
-function buildReviewResponse(review) {
+function buildReviewResponse(review, taxCenterCounts = null) {
   const summary = review?.summary && typeof review.summary === "object" ? review.summary : {};
   const counts = review?.counts && typeof review.counts === "object" ? review.counts : {};
   const suggestions = Array.isArray(review?.suggestions) ? review.suggestions : [];
@@ -247,9 +247,22 @@ function buildReviewResponse(review) {
     suggestionCount: suggestions.length,
     suggestions,
     progress,
+    taxCenterCounts: taxCenterCounts || undefined,
     errorMessage: review?.errorMessage || null,
     errorCode: review?.errorCode || null,
   });
+}
+
+function shouldReuseExistingReview(existingReview, taxCenterCounts) {
+  if (!existingReview) return false;
+  if (["queued", "running", "preparing", "processing"].includes(existingReview.status)) {
+    return true;
+  }
+  if (["completed", "applied"].includes(existingReview.status)) {
+    const suggestionCount = Array.isArray(existingReview.suggestions) ? existingReview.suggestions.length : 0;
+    return suggestionCount > 0 || Number(taxCenterCounts?.aiEligibleTransactionCount || 0) === 0;
+  }
+  return false;
 }
 
 async function fetchPlaidTransactionsForUser({
@@ -342,6 +355,61 @@ function passesFilters(record, query = {}) {
   return matchesClassification && matchesDeductibility && matchesItem && matchesPending && matchesSource && matchesSearch;
 }
 
+function isNonIncomeExpense(transaction) {
+  return !transaction?.isIncome;
+}
+
+function isUnappliedAiSuggestion(transaction) {
+  return isNonIncomeExpense(transaction) &&
+    transaction?.classificationSource === "ai_suggestion" &&
+    !transaction?.userConfirmed;
+}
+
+function isManualReviewTransaction(transaction) {
+  return isNonIncomeExpense(transaction) &&
+    transaction?.classification === "needs_review" &&
+    transaction?.classificationSource !== "ai_suggestion";
+}
+
+function isAiEligibleTransaction(transaction) {
+  return isNonIncomeExpense(transaction) &&
+    !transaction?.userConfirmed &&
+    transaction?.classificationSource !== "ai_suggestion" &&
+    transaction?.classification !== "excluded";
+}
+
+function reviewSortValue(review) {
+  return String(review?.updatedAt || review?.createdAt || "");
+}
+
+function findLatestReviewForYear(reviews, year) {
+  return (Array.isArray(reviews) ? reviews : [])
+    .filter((review) => review?.year === year)
+    .sort((left, right) => reviewSortValue(right).localeCompare(reviewSortValue(left)))[0] || null;
+}
+
+function buildTaxCenterCounts(transactions, latestReview = null) {
+  const expenseTransactions = (Array.isArray(transactions) ? transactions : []).filter(isNonIncomeExpense);
+  const processingReview = latestReview && ["queued", "preparing", "processing", "running"].includes(latestReview.status)
+    ? latestReview
+    : null;
+
+  return {
+    totalTransactions: expenseTransactions.length,
+    unreviewedTransactionCount: expenseTransactions.filter((transaction) => !transaction.userConfirmed).length,
+    manualReviewCount: expenseTransactions.filter(isManualReviewTransaction).length,
+    aiEligibleTransactionCount: expenseTransactions.filter(isAiEligibleTransaction).length,
+    aiReviewProcessingCount: Number(processingReview?.progress?.total || 0),
+    aiSuggestionCount: Array.isArray(latestReview?.suggestions)
+      ? latestReview.suggestions.length
+      : expenseTransactions.filter((transaction) => transaction.classificationSource === "ai_suggestion").length,
+    unappliedAiSuggestionCount: expenseTransactions.filter(isUnappliedAiSuggestion).length,
+    confirmedBusinessCount: expenseTransactions.filter((transaction) => transaction.userConfirmed && transaction.classification === "business").length,
+    confirmedPersonalCount: expenseTransactions.filter((transaction) => transaction.userConfirmed && transaction.classification === "personal").length,
+    excludedCount: expenseTransactions.filter((transaction) => transaction.classification === "excluded").length,
+  };
+}
+
 function buildSummary(transactions, threshold) {
   const summary = {
     totalBusiness: 0,
@@ -362,6 +430,18 @@ function buildSummary(transactions, threshold) {
       ai_suggestions: 0,
       confirmed: 0,
       high_confidence: 0,
+    },
+    taxCenterCounts: {
+      totalTransactions: 0,
+      unreviewedTransactionCount: 0,
+      manualReviewCount: 0,
+      aiEligibleTransactionCount: 0,
+      aiReviewProcessingCount: 0,
+      aiSuggestionCount: 0,
+      unappliedAiSuggestionCount: 0,
+      confirmedBusinessCount: 0,
+      confirmedPersonalCount: 0,
+      excludedCount: 0,
     },
   };
 
@@ -546,14 +626,21 @@ export function createTaxRouter({
           }
           return true;
         })
-        .filter((record) => passesFilters(record, req.query))
         .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+      const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
+      const scopedTransactions = refreshed.filter((record) => passesFilters(record, req.query));
+      const taxCenterCounts = buildTaxCenterCounts(refreshed, latestReview);
+      const summary = {
+        ...buildSummary(scopedTransactions, config.highConfidenceThreshold),
+        taxCenterCounts,
+      };
 
       return res.json({
         ok: true,
         year,
-        transactions: refreshed.map(buildTransactionResponse),
-        summary: buildSummary(refreshed, config.highConfidenceThreshold),
+        transactions: scopedTransactions.map(buildTransactionResponse),
+        summary,
+        latestReview: latestReview ? buildReviewResponse(latestReview, taxCenterCounts) : null,
         rulesCount: allRules.length,
       });
     } catch (error) {
@@ -641,6 +728,10 @@ export function createTaxRouter({
       const selectedIds = Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [];
       const selectedKey = [...selectedIds].sort().join("|");
       const existingReviews = await taxStore.listReviews(req.auth.uid);
+      const allTransactions = await taxStore.listTransactions(req.auth.uid);
+      const yearTransactions = allTransactions.filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      const latestReview = findLatestReviewForYear(existingReviews, year);
+      const currentTaxCenterCounts = buildTaxCenterCounts(yearTransactions, latestReview);
       const today = new Date().toISOString().slice(0, 10);
       const todayCount = existingReviews.filter((review) => String(review.createdAt || "").slice(0, 10) === today).length;
       if (todayCount >= config.dailyRunLimit) {
@@ -652,19 +743,20 @@ export function createTaxRouter({
         String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
         ["queued", "running", "preparing", "processing", "completed", "applied"].includes(review.status)
       );
-      if (existing) {
-        return res.json({ ok: true, review: existing, reused: true });
+      if (shouldReuseExistingReview(existing, currentTaxCenterCounts)) {
+        return res.json({ ok: true, review: buildReviewResponse(existing, currentTaxCenterCounts), reused: true });
       }
       const reviewId = nextReviewId();
 
-      const allTransactions = await taxStore.listTransactions(req.auth.uid);
-      let candidates = allTransactions.filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      let candidates = yearTransactions;
 
       if (mode === "selected") {
         const selectedSet = new Set(selectedIds);
-        candidates = candidates.filter((transaction) => selectedSet.has(transaction.id));
+        candidates = candidates.filter((transaction) => selectedSet.has(transaction.id) && isNonIncomeExpense(transaction));
       } else if (mode === "unreviewed") {
-        candidates = candidates.filter((transaction) => reprocess || !transaction.userConfirmed);
+        candidates = candidates.filter((transaction) => reprocess ? isNonIncomeExpense(transaction) : isAiEligibleTransaction(transaction));
+      } else {
+        candidates = candidates.filter((transaction) => reprocess ? isNonIncomeExpense(transaction) : isAiEligibleTransaction(transaction));
       }
 
       const rules = await taxStore.listRules(req.auth.uid);
@@ -726,8 +818,11 @@ export function createTaxRouter({
           flags: transaction.flags || [],
         })),
       });
+      const refreshedTransactions = (await taxStore.listTransactions(req.auth.uid))
+        .filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      const refreshedTaxCenterCounts = buildTaxCenterCounts(refreshedTransactions, responseReview);
 
-      return res.status(201).json({ ok: true, review: buildReviewResponse(responseReview) });
+      return res.status(201).json({ ok: true, review: buildReviewResponse(responseReview, refreshedTaxCenterCounts) });
     } catch (error) {
       logger.error("TAX AI REVIEW ERROR", errorSummary(error));
       return res.status(503).json({ ok: false, error: error?.message || "AI Tax Review is temporarily unavailable. Please try again." });
@@ -739,7 +834,10 @@ export function createTaxRouter({
     if (!review) {
       return res.status(404).json({ ok: false, error: "AI review not found." });
     }
-    return res.json({ ok: true, review: buildReviewResponse(review) });
+    const yearTransactions = (await taxStore.listTransactions(req.auth.uid))
+      .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year);
+    const taxCenterCounts = buildTaxCenterCounts(yearTransactions, review);
+    return res.json({ ok: true, review: buildReviewResponse(review, taxCenterCounts) });
   });
 
   router.post("/ai/reviews/:reviewId/apply", async (req, res) => {
@@ -890,10 +988,16 @@ export function createTaxRouter({
     const year = normalizeYear(req.query.year);
     const transactions = (await taxStore.listTransactions(req.auth.uid))
       .filter((item) => new Date(item.date || "").getUTCFullYear() === year);
+    const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
+    const taxCenterCounts = buildTaxCenterCounts(transactions, latestReview);
     return res.json({
       ok: true,
       year,
-      summary: buildSummary(transactions, config.highConfidenceThreshold),
+      summary: {
+        ...buildSummary(transactions, config.highConfidenceThreshold),
+        taxCenterCounts,
+      },
+      latestReview: latestReview ? buildReviewResponse(latestReview, taxCenterCounts) : null,
     });
   });
 
@@ -911,10 +1015,13 @@ export function createTaxRouter({
 }
 
 export {
+  buildTaxCenterCounts,
   buildReviewResponse,
   buildSummary,
   buildTransactionResponse,
   fetchPlaidTransactionsForUser,
+  findLatestReviewForYear,
   mapPlaidTransaction,
+  shouldReuseExistingReview,
   yearDateRange,
 };
