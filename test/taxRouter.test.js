@@ -6,6 +6,7 @@ import { createTaxStore } from "../taxStore.js";
 import {
   buildPlaidTransactionsGetRequest,
   buildPlaidTransactionsSyncRequest,
+  buildReviewResponse,
   createTaxRouter,
 } from "../taxRouter.js";
 import {
@@ -15,6 +16,12 @@ import {
   runTaxAiReview,
   validateSuggestionShape,
 } from "../taxAiService.js";
+import {
+  normalizeDateValue,
+  normalizeReviewRecord,
+  normalizeRuleRecord,
+  normalizeTransactionRecord,
+} from "../taxStore.js";
 
 function makeLogger() {
   const entries = [];
@@ -341,6 +348,66 @@ test("error extraction stops collapsing nested OpenAI errors into UNKNOWN", () =
   assert.equal(details.status, 400);
   assert.equal(details.requestId, "req-tax-123");
   assert.equal(details.message, "Schema failed validation");
+});
+
+test("Firestore timestamp-like values normalize to ISO strings for Tax payloads", () => {
+  const timestamp = {
+    toDate() {
+      return new Date("2026-07-04T12:00:00.000Z");
+    },
+  };
+
+  assert.equal(normalizeDateValue(timestamp), "2026-07-04T12:00:00.000Z");
+
+  const transaction = normalizeTransactionRecord({
+    id: "tx-1",
+    originalName: "Shell",
+    amount: 25,
+    date: timestamp,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const rule = normalizeRuleRecord({
+    id: "rule-1",
+    classification: "business",
+    deductibility: "deductible",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const review = normalizeReviewRecord({
+    id: "review-1",
+    year: 2026,
+    status: "processing",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+
+  assert.equal(transaction.date, "2026-07-04T12:00:00.000Z");
+  assert.equal(rule.updatedAt, "2026-07-04T12:00:00.000Z");
+  assert.equal(review.createdAt, "2026-07-04T12:00:00.000Z");
+});
+
+test("review response contract always includes suggestions arrays and count fields", () => {
+  const review = buildReviewResponse({
+    id: "review-1",
+    year: 2026,
+    mode: "all",
+    status: "processing",
+    suggestions: undefined,
+    summary: undefined,
+    counts: undefined,
+    progress: {
+      stage: "processing",
+      stageIndex: 1,
+      totalStages: 3,
+      processed: 4,
+      total: 12,
+    },
+  });
+
+  assert.deepEqual(review.suggestions, []);
+  assert.equal(review.suggestionCount, 0);
+  assert.equal(review.transactionCount, 12);
 });
 
 test("user A cannot access user B tax transactions", async () => {

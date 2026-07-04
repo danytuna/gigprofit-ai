@@ -220,6 +220,38 @@ function buildTransactionResponse(record) {
   });
 }
 
+function buildReviewResponse(review) {
+  const summary = review?.summary && typeof review.summary === "object" ? review.summary : {};
+  const counts = review?.counts && typeof review.counts === "object" ? review.counts : {};
+  const suggestions = Array.isArray(review?.suggestions) ? review.suggestions : [];
+  const progress = review?.progress && typeof review.progress === "object"
+    ? compactObject({
+        stage: review.progress.stage,
+        stageIndex: review.progress.stageIndex,
+        totalStages: review.progress.totalStages,
+        processed: review.progress.processed,
+        total: review.progress.total,
+      })
+    : null;
+
+  return compactObject({
+    id: String(review?.id || ""),
+    reviewId: String(review?.id || ""),
+    year: Number(review?.year || new Date().getUTCFullYear()),
+    mode: review?.mode || "unreviewed",
+    status: review?.status || "queued",
+    selectedTransactionIds: Array.isArray(review?.selectedTransactionIds) ? review.selectedTransactionIds : [],
+    summary,
+    counts,
+    transactionCount: Number(summary.total || progress?.total || 0),
+    suggestionCount: suggestions.length,
+    suggestions,
+    progress,
+    errorMessage: review?.errorMessage || null,
+    errorCode: review?.errorCode || null,
+  });
+}
+
 async function fetchPlaidTransactionsForUser({
   uid,
   store,
@@ -640,13 +672,13 @@ export function createTaxRouter({
         id: reviewId,
         year,
         mode,
-        status: "running",
+        status: "preparing",
         selectedTransactionIds: selectedIds,
         autoApplyHighConfidence: false,
         progress: {
-          stage: "Preparing transactions",
+          stage: "preparing",
           stageIndex: 0,
-          totalStages: 6,
+          totalStages: 3,
           processed: 0,
           total: candidates.length,
         },
@@ -695,7 +727,7 @@ export function createTaxRouter({
         })),
       });
 
-      return res.status(201).json({ ok: true, review: responseReview });
+      return res.status(201).json({ ok: true, review: buildReviewResponse(responseReview) });
     } catch (error) {
       logger.error("TAX AI REVIEW ERROR", errorSummary(error));
       return res.status(503).json({ ok: false, error: error?.message || "AI Tax Review is temporarily unavailable. Please try again." });
@@ -707,7 +739,7 @@ export function createTaxRouter({
     if (!review) {
       return res.status(404).json({ ok: false, error: "AI review not found." });
     }
-    return res.json({ ok: true, review });
+    return res.json({ ok: true, review: buildReviewResponse(review) });
   });
 
   router.post("/ai/reviews/:reviewId/apply", async (req, res) => {
@@ -879,6 +911,7 @@ export function createTaxRouter({
 }
 
 export {
+  buildReviewResponse,
   buildSummary,
   buildTransactionResponse,
   fetchPlaidTransactionsForUser,

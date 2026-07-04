@@ -21,6 +21,49 @@ function normalizeYear(value, fallback = new Date().getUTCFullYear()) {
   return year;
 }
 
+function normalizeDateValue(value, fallback = null) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value?.toDate === "function") {
+    try {
+      const date = value.toDate();
+      if (date instanceof Date && !Number.isNaN(date.getTime())) {
+        return date.toISOString();
+      }
+    } catch {
+      return fallback;
+    }
+  }
+
+  if (typeof value?.seconds === "number") {
+    const nanos = typeof value.nanoseconds === "number" ? value.nanoseconds : 0;
+    const millis = (value.seconds * 1000) + Math.round(nanos / 1_000_000);
+    const date = new Date(millis);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+
+  if (typeof value === "number") {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+
+  return fallback;
+}
+
 function buildTransactionDocRef(firestore, uid, transactionId) {
   return firestore
     .collection("users")
@@ -55,8 +98,8 @@ function normalizeTransactionRecord(record = {}) {
     originalName: record.originalName || record.name || "",
     amount: Number(record.amount || 0),
     isoCurrencyCode: record.isoCurrencyCode || "USD",
-    authorizedDate: record.authorizedDate || null,
-    date: record.date || null,
+    authorizedDate: normalizeDateValue(record.authorizedDate, null),
+    date: normalizeDateValue(record.date, null),
     pending: Boolean(record.pending),
     pendingTransactionId: record.pendingTransactionId || null,
     primaryCategory: record.primaryCategory || null,
@@ -71,9 +114,9 @@ function normalizeTransactionRecord(record = {}) {
     confidence: typeof record.confidence === "number" ? record.confidence : null,
     aiReason: record.aiReason || null,
     userConfirmed: Boolean(record.userConfirmed),
-    reviewedAt: record.reviewedAt || null,
-    createdAt: record.createdAt || nowIso(),
-    updatedAt: record.updatedAt || nowIso(),
+    reviewedAt: normalizeDateValue(record.reviewedAt, null),
+    createdAt: normalizeDateValue(record.createdAt, nowIso()),
+    updatedAt: normalizeDateValue(record.updatedAt, nowIso()),
     schemaVersion: Number(record.schemaVersion || 1),
     isIncome: Boolean(record.isIncome),
     reviewId: record.reviewId || null,
@@ -95,8 +138,8 @@ function normalizeRuleRecord(rule = {}) {
     businessUsePercentage: rule.businessUsePercentage ?? null,
     enabled: rule.enabled !== false,
     priority: Number(rule.priority || 100),
-    createdAt: rule.createdAt || nowIso(),
-    updatedAt: rule.updatedAt || nowIso(),
+    createdAt: normalizeDateValue(rule.createdAt, nowIso()),
+    updatedAt: normalizeDateValue(rule.updatedAt, nowIso()),
     source: rule.source || "user",
     schemaVersion: Number(rule.schemaVersion || 1),
   };
@@ -114,8 +157,10 @@ function normalizeReviewRecord(review = {}) {
     progress: review.progress || {},
     suggestions: Array.isArray(review.suggestions) ? review.suggestions : [],
     counts: review.counts || {},
-    createdAt: review.createdAt || nowIso(),
-    updatedAt: review.updatedAt || nowIso(),
+    createdAt: normalizeDateValue(review.createdAt, nowIso()),
+    updatedAt: normalizeDateValue(review.updatedAt, nowIso()),
+    errorMessage: review.errorMessage || null,
+    errorCode: review.errorCode || null,
     schemaVersion: Number(review.schemaVersion || 1),
   };
 }
@@ -388,6 +433,7 @@ function createTaxStore({ firestore, admin, mode = "firestore" } = {}) {
 
 export {
   createTaxStore,
+  normalizeDateValue,
   normalizeRuleRecord,
   normalizeTransactionRecord,
   normalizeReviewRecord,
