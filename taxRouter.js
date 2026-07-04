@@ -614,16 +614,14 @@ export function createTaxRouter({
       if (todayCount >= config.dailyRunLimit) {
         return res.status(429).json({ ok: false, error: "Daily AI tax review limit reached." });
       }
-      if (!reprocess) {
-        const existing = existingReviews.find((review) =>
-          review.year === year &&
-          review.mode === mode &&
-          String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
-          ["queued", "running", "completed", "applied"].includes(review.status)
-        );
-        if (existing) {
-          return res.json({ ok: true, review: existing, reused: true });
-        }
+      const existing = existingReviews.find((review) =>
+        review.year === year &&
+        review.mode === mode &&
+        String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
+        ["queued", "running", "preparing", "processing", "completed", "applied"].includes(review.status)
+      );
+      if (existing) {
+        return res.json({ ok: true, review: existing, reused: true });
       }
       const reviewId = nextReviewId();
 
@@ -662,6 +660,7 @@ export function createTaxRouter({
         config,
         reviewId,
         year,
+        mode,
         transactions: candidates,
         rules,
       });
@@ -699,7 +698,7 @@ export function createTaxRouter({
       return res.status(201).json({ ok: true, review: responseReview });
     } catch (error) {
       logger.error("TAX AI REVIEW ERROR", errorSummary(error));
-      return res.status(500).json({ ok: false, error: "Failed to prepare AI tax review." });
+      return res.status(503).json({ ok: false, error: error?.message || "AI Tax Review is temporarily unavailable. Please try again." });
     }
   });
 
@@ -725,6 +724,9 @@ export function createTaxRouter({
         mode: req.body?.mode || "all",
         transactionIds: Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [],
       }, config.highConfidenceThreshold);
+      if (!preview.count) {
+        return res.status(400).json({ ok: false, error: "No AI suggestions are available to apply." });
+      }
 
       const saved = [];
       for (const suggestion of preview.suggestions) {

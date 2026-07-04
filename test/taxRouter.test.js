@@ -8,6 +8,13 @@ import {
   buildPlaidTransactionsSyncRequest,
   createTaxRouter,
 } from "../taxRouter.js";
+import {
+  buildTaxReviewResponsesParams,
+  buildTaxConfigFromEnv,
+  extractOpenAIErrorDetails,
+  runTaxAiReview,
+  validateSuggestionShape,
+} from "../taxAiService.js";
 
 function makeLogger() {
   const entries = [];
@@ -140,6 +147,21 @@ function createRouterFixture({
     encryptionKey: Buffer.alloc(32, 1),
     openaiClient: {
       responses: {
+        parse: async (payload) => {
+          openaiCalls.push(payload);
+          if (openaiHandler) {
+            return openaiHandler(payload);
+          }
+          return {
+            output_text: JSON.stringify({
+              suggestions: [],
+            }),
+            output_parsed: {
+              suggestions: [],
+            },
+            output: [],
+          };
+        },
         create: async (payload) => {
           openaiCalls.push(payload);
           if (openaiHandler) {
@@ -147,7 +169,7 @@ function createRouterFixture({
           }
           return {
             output_text: JSON.stringify({
-              results: [],
+              suggestions: [],
             }),
             output: [],
           };
@@ -173,6 +195,24 @@ function createRouterFixture({
     logger,
     openaiCalls,
     plaidClient: resolvedPlaidClient,
+  };
+}
+
+function makeParsedSuggestionsResponse(suggestions) {
+  return {
+    output_text: JSON.stringify({ suggestions }),
+    output_parsed: { suggestions },
+    output: [
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: JSON.stringify({ suggestions }),
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -232,6 +272,75 @@ test("Plaid request builders strip undefined and null values", () => {
   assert.deepEqual(syncRequest, {
     access_token: "secret-token",
   });
+});
+
+test("AI tax config defaults to safe production-oriented values", () => {
+  const config = buildTaxConfigFromEnv({});
+  assert.equal(config.enabled, true);
+  assert.equal(config.batchSize, 10);
+  assert.equal(config.maxTransactionsPerRun, 1000);
+  assert.equal(config.highConfidenceThreshold, 0.92);
+  assert.equal(config.autoApplyEnabled, false);
+  assert.equal(config.dailyRunLimit, 3);
+  assert.equal(config.model, "gpt-4.1-mini");
+});
+
+test("AI tax review request omits unsupported responses fields for gpt-4.1-mini", () => {
+  const params = buildTaxReviewResponsesParams({
+    model: "gpt-4.1-mini",
+    transactions: [
+      { id: "tx-1", merchant: "Shell", amount: 25, date: "2026-01-10", plaidCategory: null, recurring: false, pending: false, isIncome: false, existingClassification: "needs_review", merchantKey: "shell" },
+    ],
+  });
+
+  assert.equal(params.model, "gpt-4.1-mini");
+  assert.equal("reasoning" in params, false);
+  assert.equal(params.text.verbosity, undefined);
+  assert.equal(params.text.format.type, "json_schema");
+});
+
+test("structured output validator accepts valid suggestions", () => {
+  const suggestions = validateSuggestionShape({
+    suggestions: [
+      {
+        transactionId: "tx-1",
+        classification: "business",
+        deductibility: "partially_deductible",
+        taxCategory: "Gas and charging",
+        businessUsePercentage: null,
+        confidence: 0.85,
+        reason: "Fuel merchant likely tied to driving work.",
+        requiresUserReview: true,
+        flags: ["mixed_use_possible"],
+      },
+    ],
+  });
+
+  assert.equal(suggestions.length, 1);
+  assert.equal(suggestions[0].transactionId, "tx-1");
+});
+
+test("error extraction stops collapsing nested OpenAI errors into UNKNOWN", () => {
+  const error = new Error("Transport wrapper failed");
+  error.cause = {
+    name: "APIError",
+    code: "invalid_json_schema",
+    status: 400,
+    response: {
+      status: 400,
+      data: {
+        request_id: "req-tax-123",
+        error_type: "invalid_request_error",
+        error_message: "Schema failed validation",
+      },
+    },
+  };
+
+  const details = extractOpenAIErrorDetails(error);
+  assert.equal(details.code, "invalid_json_schema");
+  assert.equal(details.status, 400);
+  assert.equal(details.requestId, "req-tax-123");
+  assert.equal(details.message, "Schema failed validation");
 });
 
 test("user A cannot access user B tax transactions", async () => {
@@ -450,6 +559,65 @@ test("transactionsGet paginates using options.count and options.offset", async (
   }
 });
 
+test("runTaxAiReview processes batches using configured limit", async () => {
+  const store = createTaxStore({ mode: "memory" });
+  const logger = makeLogger();
+  const parseCalls = [];
+  const transactions = Array.from({ length: 5 }, (_, index) => ({
+    id: `tx-${index + 1}`,
+    merchantName: `Merchant ${index + 1}`,
+    originalName: `Merchant ${index + 1}`,
+    amount: 25 + index,
+    date: "2026-06-15",
+    pending: false,
+    isIncome: false,
+    classification: "needs_review",
+  }));
+
+  for (const transaction of transactions) {
+    await store.upsertTransaction("user-a", transaction);
+  }
+
+  const review = await runTaxAiReview({
+    uid: "user-a",
+    store,
+    openaiClient: {
+      responses: {
+        parse: async (payload) => {
+          parseCalls.push(payload);
+          const txs = JSON.parse(payload.input[1].content[0].text).transactions;
+          return makeParsedSuggestionsResponse(txs.map((item) => ({
+            transactionId: item.id,
+            classification: "business",
+            deductibility: "needs_review",
+            taxCategory: "Other business expense",
+            businessUsePercentage: null,
+            confidence: 0.72,
+            reason: "Needs quick review.",
+            requiresUserReview: true,
+            flags: [],
+          })));
+        },
+      },
+    },
+    logger,
+    config: {
+      ...buildTaxConfigFromEnv({}),
+      batchSize: 2,
+      maxTransactionsPerRun: 10,
+      model: "gpt-4.1-mini",
+    },
+    reviewId: "review-batch",
+    year: 2026,
+    transactions,
+    rules: [],
+  });
+
+  assert.equal(parseCalls.length, 3);
+  assert.equal(review.status, "completed");
+  assert.equal(review.suggestions.length, 5);
+});
+
 test("Plaid UNKNOWN_FIELDS returns a clean client error and sanitized logs", async () => {
   const plaidError = new Error("Request failed with status code 400");
   plaidError.response = {
@@ -492,6 +660,43 @@ test("Plaid UNKNOWN_FIELDS returns a clean client error and sanitized logs", asy
     assert.doesNotMatch(serializedLogs, /access_token/);
     assert.match(serializedLogs, /topLevelKeys/);
     assert.match(serializedLogs, /optionKeys/);
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("invalid structured output returns a clean AI tax review error", async () => {
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "token-a")] },
+    transactionsByAccessToken: {
+      "token-a": [makeTransaction({ id: "tx-invalid", name: "Acme Services", amount: 120 })],
+    },
+    openaiHandler: async () => ({
+      output_text: JSON.stringify({ suggestions: [{ transactionId: "tx-invalid", classification: "weird" }] }),
+      output_parsed: { suggestions: [{ transactionId: "tx-invalid", classification: "weird" }] },
+      output: [],
+    }),
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const reviewResponse = await fetch(`${url}/tax/ai/review`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ year: 2026, mode: "all" }),
+    });
+    const reviewBody = await reviewResponse.json();
+
+    assert.equal(reviewResponse.status, 503);
+    assert.equal(reviewBody.ok, false);
+    assert.match(reviewBody.error, /AI Tax Review is temporarily unavailable/i);
+    const serializedLogs = JSON.stringify(fixture.logger.entries);
+    assert.match(serializedLogs, /validation/);
+    assert.doesNotMatch(serializedLogs, /Acme Services|120/);
   } finally {
     await stopServer(server);
   }
@@ -547,8 +752,7 @@ test("AI review stores suggestions as unconfirmed and apply requires authorizati
       "token-a": [makeTransaction({ id: "tx-ambiguous", name: "Acme Services", amount: 120 })],
     },
     openaiHandler: async () => ({
-      output_text: JSON.stringify({
-        results: [
+      ...makeParsedSuggestionsResponse([
           {
             transactionId: "tx-ambiguous",
             classification: "business",
@@ -559,9 +763,7 @@ test("AI review stores suggestions as unconfirmed and apply requires authorizati
             requiresUserReview: true,
             flags: ["mixed_use_possible"],
           },
-        ],
-      }),
-      output: [],
+        ]),
     }),
   });
   const { server, url } = await startServer(fixture.router);
@@ -612,6 +814,137 @@ test("AI review stores suggestions as unconfirmed and apply requires authorizati
   }
 });
 
+test("AI review with five transactions generates saved suggestions", async () => {
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "token-a")] },
+    transactionsByAccessToken: {
+      "token-a": Array.from({ length: 5 }, (_, index) =>
+        makeTransaction({ id: `tx-five-${index + 1}`, name: `Service ${index + 1}`, amount: 30 + index })
+      ),
+    },
+    openaiHandler: async (payload) => {
+      const txs = JSON.parse(payload.input[1].content[0].text).transactions;
+      return makeParsedSuggestionsResponse(
+        txs.map((item) => ({
+          transactionId: item.id,
+          classification: "business",
+          deductibility: "needs_review",
+          taxCategory: "Other business expense",
+          businessUsePercentage: null,
+          confidence: 0.76,
+          reason: "Looks work-related but should be reviewed.",
+          requiresUserReview: true,
+          flags: [],
+        }))
+      );
+    },
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const response = await fetch(`${url}/tax/ai/review`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ year: 2026, mode: "all" }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 201);
+    assert.equal(body.review.suggestions.length, 5);
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("double tap on all-mode review reuses the in-flight or completed review", async () => {
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "token-a")] },
+    transactionsByAccessToken: {
+      "token-a": [makeTransaction({ id: "tx-double", name: "Acme Services", amount: 50 })],
+    },
+    openaiHandler: async () => makeParsedSuggestionsResponse([{
+      transactionId: "tx-double",
+      classification: "business",
+      deductibility: "needs_review",
+      taxCategory: "Other business expense",
+      businessUsePercentage: null,
+      confidence: 0.74,
+      reason: "Review before filing.",
+      requiresUserReview: true,
+      flags: [],
+    }]),
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const first = await fetch(`${url}/tax/ai/review`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ year: 2026, mode: "all", reprocess: true }),
+    });
+    const firstBody = await first.json();
+    const second = await fetch(`${url}/tax/ai/review`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ year: 2026, mode: "all", reprocess: true }),
+    });
+    const secondBody = await second.json();
+    assert.equal(secondBody.reused, true);
+    assert.equal(secondBody.review.id, firstBody.review.id);
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("apply suggestions stays unavailable when no saved suggestions exist", async () => {
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "token-a")] },
+    transactionsByAccessToken: {
+      "token-a": [makeTransaction({ id: "tx-none", name: "Ambiguous Merchant", amount: 42 })],
+    },
+    openaiHandler: async () => makeParsedSuggestionsResponse([]),
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const reviewResponse = await fetch(`${url}/tax/ai/review`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ year: 2026, mode: "all" }),
+    });
+    const reviewBody = await reviewResponse.json();
+    assert.equal(reviewBody.review.suggestions.length, 0);
+
+    const applyResponse = await fetch(`${url}/tax/ai/reviews/${reviewBody.review.id}/apply`, {
+      method: "POST",
+      headers: {
+        "x-user-id": "user-a",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ mode: "all", confirm: true }),
+    });
+    const applyBody = await applyResponse.json();
+    assert.equal(applyResponse.status, 400);
+    assert.match(applyBody.error, /No AI suggestions are available to apply/i);
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("AI payload excludes access tokens and account numbers", async () => {
   const fixture = createRouterFixture({
     itemsByUser: { "user-a": [makeItem("item-a", "super-secret-access-token", { accountId: "account-7777", mask: "7777" })] },
@@ -619,8 +952,7 @@ test("AI payload excludes access tokens and account numbers", async () => {
       "super-secret-access-token": [makeTransaction({ id: "tx-safe", name: "Acme Services", amount: 88 })],
     },
     openaiHandler: async () => ({
-      output_text: JSON.stringify({
-        results: [{
+      ...makeParsedSuggestionsResponse([{
           transactionId: "tx-safe",
           classification: "needs_review",
           deductibility: "needs_review",
@@ -629,9 +961,7 @@ test("AI payload excludes access tokens and account numbers", async () => {
           reason: "Needs review.",
           requiresUserReview: true,
           flags: [],
-        }],
-      }),
-      output: [],
+        }]),
     }),
   });
   const { server, url } = await startServer(fixture.router);
@@ -660,8 +990,7 @@ test("review deletion clears AI suggestions and /health stays working", async ()
       "token-a": [makeTransaction({ id: "tx-1", name: "Acme Services", amount: 88 })],
     },
     openaiHandler: async () => ({
-      output_text: JSON.stringify({
-        results: [{
+      ...makeParsedSuggestionsResponse([{
           transactionId: "tx-1",
           classification: "needs_review",
           deductibility: "needs_review",
@@ -670,9 +999,7 @@ test("review deletion clears AI suggestions and /health stays working", async ()
           reason: "Needs review.",
           requiresUserReview: true,
           flags: [],
-        }],
-      }),
-      output: [],
+        }]),
     }),
   });
   const { server, url } = await startServer(fixture.router);
