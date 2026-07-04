@@ -1,6 +1,5 @@
 import express from "express";
 import dotenv from "dotenv";
-import OpenAI from "openai";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 import { fileURLToPath } from "url";
 import { applyHttpSecurity, createPlaidRateLimiter } from "./httpSecurity.js";
@@ -9,7 +8,7 @@ import { createRequireFirebaseAuth } from "./requireFirebaseAuth.js";
 import { resolveEncryptionKey, encryptSecret, decryptSecret } from "./plaidCrypto.js";
 import { createPlaidStore } from "./plaidStore.js";
 import { createPlaidRouter } from "./plaidRouter.js";
-import { createAskHandler } from "./aiCopilot.js";
+import { createAskHandler, createOpenAIClient } from "./aiCopilot.js";
 
 dotenv.config();
 
@@ -96,10 +95,10 @@ const plaidStore = createPlaidStore(
 // OPENAI
 // --------------------------------------------------
 
-const client = new OpenAI({
+const client = createOpenAIClient({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: 30_000,
-  maxRetries: 0,
+  logger: console,
 });
 
 // --------------------------------------------------

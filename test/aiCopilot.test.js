@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  OPENAI_TRANSPORT_NAME,
   TEMPORARY_UNAVAILABLE_BODY,
+  createOpenAIClient,
+  createOpenAINativeFetch,
   createAskHandler,
+  isRetryableError,
   requestCopilotReply,
 } from "../aiCopilot.js";
 
@@ -29,12 +33,64 @@ function makeLogger() {
     error(message, payload) {
       entries.push({ level: "error", message, payload });
     },
+    info(message) {
+      entries.push({ level: "info", message });
+    },
   };
 }
 
 function makeRequest(body = {}) {
   return { body };
 }
+
+test("OpenAI transport uses native fetch and logs the transport name", async () => {
+  const logger = makeLogger();
+  const calls = [];
+  const nativeFetch = async (input, init) => {
+    calls.push({
+      input,
+      init,
+    });
+
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+      text: async () => "ok",
+    };
+  };
+
+  const transport = createOpenAINativeFetch(nativeFetch);
+  await transport("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].init.headers.get("Accept-Encoding"), "identity");
+  assert.equal(calls[0].init.headers.get("Content-Type"), "application/json");
+
+  const client = createOpenAIClient({
+    apiKey: "test-key",
+    logger,
+    nativeFetch,
+  });
+
+  assert.equal(typeof client.fetch, "function");
+  await client.fetch("https://api.openai.com/v1/models", {
+    method: "GET",
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].init.headers.get("Accept-Encoding"), "identity");
+  assert.deepEqual(logger.entries, [
+    {
+      level: "info",
+      message: `OpenAI transport: ${OPENAI_TRANSPORT_NAME}`,
+    },
+  ]);
+});
 
 test("AI copilot succeeds on first attempt", async () => {
   const logger = makeLogger();
@@ -71,6 +127,18 @@ test("AI copilot succeeds on first attempt", async () => {
   assert.equal(calls, 1);
   assert.equal(result.reply, "All good");
   assert.deepEqual(logger.entries, []);
+  assert.deepEqual(result, {
+    reply: "All good",
+    mode: "general",
+    source: "railway-v3-copilot",
+  });
+});
+
+test("ERR_STREAM_PREMATURE_CLOSE remains retryable", () => {
+  const error = new Error("Premature close");
+  error.code = "ERR_STREAM_PREMATURE_CLOSE";
+
+  assert.equal(isRetryableError(error), true);
 });
 
 test("AI copilot succeeds after ERR_STREAM_PREMATURE_CLOSE", async () => {
@@ -229,4 +297,3 @@ test("AI copilot handler never exposes prompt or technical error details", async
     assert.doesNotMatch(JSON.stringify(entry), /top secret prompt body|sensitive context/i);
   }
 });
-

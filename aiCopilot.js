@@ -1,5 +1,8 @@
+import OpenAI from "openai";
+
 const RETRY_DELAYS_MS = [500, 1000, 2000];
 const MAX_ATTEMPTS = 3;
+const OPENAI_TRANSPORT_NAME = "native-fetch";
 const TEMPORARY_UNAVAILABLE_BODY = {
   error: "AI temporarily unavailable",
   message: "GigProfit AI is temporarily unavailable. Please try again.",
@@ -7,6 +10,70 @@ const TEMPORARY_UNAVAILABLE_BODY = {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveRequestUrl(input) {
+  if (typeof input === "string" || input instanceof URL) {
+    return new URL(String(input));
+  }
+
+  if (typeof input?.url === "string" && input.url) {
+    return new URL(input.url);
+  }
+
+  return null;
+}
+
+function buildOpenAIHeaders(input, init = {}) {
+  const headers = new Headers(input?.headers || {});
+
+  if (init.headers) {
+    const initHeaders = new Headers(init.headers);
+    initHeaders.forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+
+  headers.set("Accept-Encoding", "identity");
+  return headers;
+}
+
+function createOpenAINativeFetch(nativeFetch = globalThis.fetch) {
+  if (typeof nativeFetch !== "function") {
+    throw new Error("Native fetch is unavailable for OpenAI transport");
+  }
+
+  return async function openAINativeFetch(input, init = {}) {
+    const url = resolveRequestUrl(input);
+    const shouldForceIdentityEncoding = url?.hostname === "api.openai.com";
+
+    if (!shouldForceIdentityEncoding) {
+      return nativeFetch(input, init);
+    }
+
+    return nativeFetch(input, {
+      ...init,
+      headers: buildOpenAIHeaders(input, init),
+    });
+  };
+}
+
+function createOpenAIClient({
+  apiKey,
+  timeout = 30_000,
+  logger = console,
+  nativeFetch = globalThis.fetch,
+} = {}) {
+  const fetch = createOpenAINativeFetch(nativeFetch);
+
+  logger.info(`OpenAI transport: ${OPENAI_TRANSPORT_NAME}`);
+
+  return new OpenAI({
+    apiKey,
+    timeout,
+    maxRetries: 0,
+    fetch,
+  });
 }
 
 function normalizeStatus(error) {
@@ -244,8 +311,11 @@ function createAskHandler({
 }
 
 export {
+  OPENAI_TRANSPORT_NAME,
   TEMPORARY_UNAVAILABLE_BODY,
   buildMessages,
+  createOpenAIClient,
+  createOpenAINativeFetch,
   createAskHandler,
   isRetryableError,
   normalizeErrorCode,
