@@ -26,7 +26,7 @@ function errorSummary(error) {
     requestId: error?.response?.data?.request_id || error?.request_id || null,
     errorCode: error?.response?.data?.error_code || error?.code || null,
     errorType: error?.response?.data?.error_type || error?.type || null,
-    message: error?.message || "Unknown error",
+    errorMessage: error?.response?.data?.error_message || error?.message || "Unknown error",
   };
 }
 
@@ -69,6 +69,96 @@ function mapPlaidTransaction(transaction, item, account) {
 
 function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+function compactPlaidRequest(value) {
+  if (Array.isArray(value)) {
+    const items = value
+      .filter((item) => item !== undefined && item !== null)
+      .map((item) => compactPlaidRequest(item));
+    return items;
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const entries = Object.entries(value)
+    .filter(([, item]) => item !== undefined && item !== null)
+    .map(([key, item]) => [key, compactPlaidRequest(item)])
+    .filter(([, item]) => {
+      if (Array.isArray(item)) {
+        return item.length > 0;
+      }
+      if (item && typeof item === "object") {
+        return Object.keys(item).length > 0;
+      }
+      return item !== undefined && item !== null;
+    });
+
+  return Object.fromEntries(entries);
+}
+
+function sanitizedAccountIds(accountIds) {
+  if (!Array.isArray(accountIds)) return undefined;
+  const cleaned = accountIds
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  return cleaned.length ? cleaned : undefined;
+}
+
+export function buildPlaidTransactionsGetRequest({
+  accessToken,
+  startDate,
+  endDate,
+  count,
+  offset,
+  accountIds,
+}) {
+  return compactPlaidRequest({
+    access_token: accessToken,
+    start_date: startDate,
+    end_date: endDate,
+    options: {
+      count,
+      offset,
+      account_ids: sanitizedAccountIds(accountIds),
+    },
+  });
+}
+
+export function buildPlaidTransactionsSyncRequest({
+  accessToken,
+  cursor,
+  count,
+  accountId,
+}) {
+  return compactPlaidRequest({
+    access_token: accessToken,
+    cursor,
+    count,
+    options: {
+      account_id: accountId ? String(accountId).trim() : undefined,
+    },
+  });
+}
+
+function summarizePlaidRequestKeys(request) {
+  const topLevelKeys = Object.keys(request || {})
+    .filter((key) => key !== "access_token")
+    .sort();
+  const optionKeys = request?.options && typeof request.options === "object"
+    ? Object.keys(request.options).sort()
+    : [];
+  return { topLevelKeys, optionKeys };
+}
+
+function logPlaidRequestError(logger, endpoint, request, error) {
+  logger.error("TAX PLAID REQUEST ERROR", {
+    plaidEndpoint: endpoint,
+    ...errorSummary(error),
+    requestKeys: summarizePlaidRequestKeys(request),
+  });
 }
 
 function mergePendingClassification(baseRecord, pendingRecord) {
@@ -136,6 +226,7 @@ async function fetchPlaidTransactionsForUser({
   plaidClient,
   decryptSecret,
   encryptionKey,
+  logger,
   itemId,
   startDate,
   endDate,
@@ -153,13 +244,21 @@ async function fetchPlaidTransactionsForUser({
     const transactions = [];
 
     while (offset < totalTransactions) {
-      const response = await plaidClient.transactionsGet({
-        access_token: accessToken,
-        start_date: startDate,
-        end_date: endDate,
+      const request = buildPlaidTransactionsGetRequest({
+        accessToken,
+        startDate,
+        endDate,
         count: pageSize,
         offset,
       });
+
+      let response;
+      try {
+        response = await plaidClient.transactionsGet(request);
+      } catch (error) {
+        logPlaidRequestError(logger, "transactionsGet", request, error);
+        throw error;
+      }
 
       const pageTransactions = response.data.transactions || [];
       totalTransactions = Number(response.data.total_transactions || pageTransactions.length);
@@ -350,6 +449,7 @@ export function createTaxRouter({
         itemId: String(req.query.item_id || "").trim() || null,
         startDate: range.startDate,
         endDate: range.endDate,
+        logger,
       });
       const replacedPendingIds = new Set(
         rawTransactions

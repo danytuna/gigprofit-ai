@@ -3,7 +3,11 @@ import test from "node:test";
 import express from "express";
 
 import { createTaxStore } from "../taxStore.js";
-import { createTaxRouter } from "../taxRouter.js";
+import {
+  buildPlaidTransactionsGetRequest,
+  buildPlaidTransactionsSyncRequest,
+  createTaxRouter,
+} from "../taxRouter.js";
 
 function makeLogger() {
   const entries = [];
@@ -27,8 +31,12 @@ function makePlaidStore(itemsByUser) {
 }
 
 function makePlaidClient(transactionsByAccessToken) {
+  const calls = [];
   return {
-    async transactionsGet({ access_token }) {
+    calls,
+    async transactionsGet(request) {
+      calls.push(request);
+      const { access_token } = request;
       return {
         data: {
           total_transactions: (transactionsByAccessToken[access_token] || []).length,
@@ -114,16 +122,18 @@ function makeTransaction({
 function createRouterFixture({
   itemsByUser,
   transactionsByAccessToken,
+  plaidClient,
   openaiHandler,
   config = {},
 } = {}) {
   const taxStore = createTaxStore({ mode: "memory" });
   const logger = makeLogger();
   const openaiCalls = [];
+  const resolvedPlaidClient = plaidClient || makePlaidClient(transactionsByAccessToken);
   const router = createTaxRouter({
     taxStore,
     plaidStore: makePlaidStore(itemsByUser),
-    plaidClient: makePlaidClient(transactionsByAccessToken),
+    plaidClient: resolvedPlaidClient,
     decryptSecret(item) {
       return item.accessToken;
     },
@@ -162,8 +172,67 @@ function createRouterFixture({
     taxStore,
     logger,
     openaiCalls,
+    plaidClient: resolvedPlaidClient,
   };
 }
+
+test("transactionsGet request only uses supported Plaid fields", () => {
+  const request = buildPlaidTransactionsGetRequest({
+    accessToken: "secret-token",
+    startDate: "2026-01-01",
+    endDate: "2026-12-31",
+    count: 500,
+    offset: 25,
+    accountIds: ["acct-1", "", null],
+  });
+
+  assert.deepEqual(Object.keys(request).sort(), ["access_token", "end_date", "options", "start_date"]);
+  assert.deepEqual(Object.keys(request.options).sort(), ["account_ids", "count", "offset"]);
+  assert.equal("count" in request, false);
+  assert.equal("offset" in request, false);
+  assert.equal("account_ids" in request, false);
+});
+
+test("transactionsSync request excludes transactionsGet-only fields", () => {
+  const request = buildPlaidTransactionsSyncRequest({
+    accessToken: "secret-token",
+    cursor: "cursor-1",
+    count: 100,
+    accountId: "acct-1",
+  });
+
+  assert.deepEqual(Object.keys(request).sort(), ["access_token", "count", "cursor", "options"]);
+  assert.deepEqual(Object.keys(request.options).sort(), ["account_id"]);
+  assert.equal("start_date" in request, false);
+  assert.equal("end_date" in request, false);
+  assert.equal("offset" in request, false);
+});
+
+test("Plaid request builders strip undefined and null values", () => {
+  const getRequest = buildPlaidTransactionsGetRequest({
+    accessToken: "secret-token",
+    startDate: "2026-01-01",
+    endDate: "2026-12-31",
+    count: undefined,
+    offset: null,
+    accountIds: [],
+  });
+  const syncRequest = buildPlaidTransactionsSyncRequest({
+    accessToken: "secret-token",
+    cursor: null,
+    count: undefined,
+    accountId: "",
+  });
+
+  assert.deepEqual(getRequest, {
+    access_token: "secret-token",
+    start_date: "2026-01-01",
+    end_date: "2026-12-31",
+  });
+  assert.deepEqual(syncRequest, {
+    access_token: "secret-token",
+  });
+});
 
 test("user A cannot access user B tax transactions", async () => {
   const fixture = createRouterFixture({
@@ -328,6 +397,101 @@ test("pending classification carries over to posted transaction and pending dupl
     assert.equal(body.transactions.length, 1);
     assert.equal(body.transactions[0].plaidTransactionId, "tx-posted");
     assert.equal(body.transactions[0].classification, "business");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("transactionsGet paginates using options.count and options.offset", async () => {
+  const calls = [];
+  const plaidClient = {
+    async transactionsGet(request) {
+      calls.push(request);
+      if (calls.length === 1) {
+        return {
+          data: {
+            total_transactions: 700,
+            transactions: Array.from({ length: 500 }, (_, index) =>
+              makeTransaction({ id: `tx-${index}`, name: `Merchant ${index}`, amount: index + 1 })
+            ),
+          },
+        };
+      }
+
+      return {
+        data: {
+          total_transactions: 700,
+          transactions: Array.from({ length: 200 }, (_, index) =>
+            makeTransaction({ id: `tx-${500 + index}`, name: `Merchant ${500 + index}`, amount: index + 1 })
+          ),
+        },
+      };
+    },
+  };
+
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "token-a")] },
+    plaidClient,
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    const response = await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.transactions.length, 700);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].options, { count: 500, offset: 0 });
+    assert.deepEqual(calls[1].options, { count: 500, offset: 500 });
+    assert.equal("count" in calls[0], false);
+    assert.equal("offset" in calls[0], false);
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("Plaid UNKNOWN_FIELDS returns a clean client error and sanitized logs", async () => {
+  const plaidError = new Error("Request failed with status code 400");
+  plaidError.response = {
+    status: 400,
+    data: {
+      error_code: "UNKNOWN_FIELDS",
+      error_type: "INVALID_REQUEST",
+      error_message: "Unknown field in request body",
+      request_id: "req-123",
+    },
+  };
+  let attempts = 0;
+
+  const fixture = createRouterFixture({
+    itemsByUser: { "user-a": [makeItem("item-a", "top-secret-token")] },
+    plaidClient: {
+      async transactionsGet() {
+        attempts += 1;
+        throw plaidError;
+      },
+    },
+  });
+  const { server, url } = await startServer(fixture.router);
+
+  try {
+    const response = await fetch(`${url}/tax/transactions?year=2026`, { headers: { "x-user-id": "user-a" } });
+    const body = await response.json();
+
+    assert.equal(response.status, 500);
+    assert.equal(attempts, 1);
+    assert.deepEqual(body, {
+      ok: false,
+      error: "Failed to load tax transactions.",
+    });
+
+    const serializedLogs = JSON.stringify(fixture.logger.entries);
+    assert.match(serializedLogs, /UNKNOWN_FIELDS/);
+    assert.match(serializedLogs, /transactionsGet/);
+    assert.doesNotMatch(serializedLogs, /top-secret-token/);
+    assert.doesNotMatch(serializedLogs, /access_token/);
+    assert.match(serializedLogs, /topLevelKeys/);
+    assert.match(serializedLogs, /optionKeys/);
   } finally {
     await stopServer(server);
   }
