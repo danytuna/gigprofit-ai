@@ -11,6 +11,9 @@ import { createPlaidRouter } from "./plaidRouter.js";
 import { createOpenAIClient } from "./aiCopilot.js";
 import { createAICopilotStore } from "./aiCopilotStore.js";
 import { buildConfigFromEnv, createAICopilotRouter } from "./aiCopilotRouter.js";
+import { createTaxStore } from "./taxStore.js";
+import { buildTaxConfigFromEnv } from "./taxAiService.js";
+import { createTaxRouter } from "./taxRouter.js";
 
 dotenv.config();
 
@@ -94,10 +97,15 @@ const plaidStore = createPlaidStore(
   firebaseAdminServices.admin
 );
 const aiCopilotConfig = buildConfigFromEnv(process.env);
+const taxConfig = buildTaxConfigFromEnv(process.env);
 const aiCopilotStore = createAICopilotStore({
   firestore: firebaseAdminServices.firestore,
   admin: firebaseAdminServices.admin,
   config: aiCopilotConfig,
+});
+const taxStore = createTaxStore({
+  firestore: firebaseAdminServices.firestore,
+  admin: firebaseAdminServices.admin,
 });
 
 // --------------------------------------------------
@@ -147,6 +155,16 @@ const plaidRouter = createPlaidRouter({
     process.env.PLAID_WEBHOOK_URL ||
     "https://gigprofit-ai-production.up.railway.app/plaid/webhook",
   admin: firebaseAdminServices.admin,
+});
+const taxRouter = createTaxRouter({
+  taxStore,
+  plaidStore,
+  plaidClient,
+  decryptSecret,
+  encryptionKey: plaidEncryptionKey,
+  openaiClient: client,
+  logger: console,
+  config: taxConfig,
 });
 
 // --------------------------------------------------
@@ -961,6 +979,7 @@ app.get("/offline/state-pack", async (req, res) => {
 
 app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
 app.use("/ai", requireFirebaseAuth, aiCopilotRouterBundle.router);
+app.use("/tax", requireFirebaseAuth, taxRouter);
 
 // --------------------------------------------------
 // START
