@@ -10,10 +10,36 @@ import { createPlaidStore } from "./plaidStore.js";
 import { createPlaidRouter } from "./plaidRouter.js";
 import { createOpenAIClient } from "./aiCopilot.js";
 import { createAICopilotStore } from "./aiCopilotStore.js";
-import { buildConfigFromEnv, createAICopilotRouter } from "./aiCopilotRouter.js";
+import { buildConfigFromEnv, createAICopilotRateLimiter, createAICopilotRouter } from "./aiCopilotRouter.js";
 import { createTaxStore } from "./taxStore.js";
 import { buildTaxConfigFromEnv } from "./taxAiService.js";
 import { createTaxRouter } from "./taxRouter.js";
+import { createOrderScanUsageStore, createUniversalOrderScanRouter } from "./universalOrderScanRouter.js";
+import { createEventRouter } from "./eventRouter.js";
+import { createDriverMapRouter } from "./driverMapRouter.js";
+import { interpretTrustedEventRange, resolveTrustedTimeContext } from "./trustedTime.js";
+import {
+  createGooglePlaySubscriptionVerifier,
+  hashGooglePlayPurchaseToken,
+} from "./googlePlaySubscription.js";
+import { verifyAppleStoreKitTransaction } from "./appleStoreKitTransaction.js";
+import {
+  APPLE_SUBSCRIPTION_OWNERSHIP_CONFLICT,
+  claimAppleSubscriptionOwnership,
+} from "./appleSubscriptionOwnership.js";
+import {
+  createCanonicalPlanAuthorizer,
+  readCanonicalSubscription,
+} from "./subscriptionPlanResolver.js";
+import { buildRadarMarketEstimate, eventDemandImpact, evidenceAdjustedRadarScore, timeDemandProfile } from "./radarIntelligence.js";
+import {
+  DEFAULT_RADAR_RADIUS_MILES,
+  discoverNationwideZones,
+  genericOfflineStatePack,
+  getNationwideEvents,
+  isValidCoordinate,
+  normalizeRadiusMiles,
+} from "./nationwideRadar.js";
 
 dotenv.config();
 
@@ -45,12 +71,14 @@ validateRequiredEnvironment({
         "PLAID_ENV",
         "PLAID_CLIENT_ID",
         "PLAID_SECRET",
+        "PLAID_ANDROID_PACKAGE_NAME",
         "FIREBASE_SERVICE_ACCOUNT_BASE64",
         "PLAID_TOKEN_ENCRYPTION_KEY",
         "ALLOWED_ORIGINS",
         "OPENAI_API_KEY",
         "TICKETMASTER_API_KEY",
         "MAPBOX_ACCESS_TOKEN",
+        "GOOGLE_MAPS_API_KEY",
       ]
     : [],
 });
@@ -59,7 +87,7 @@ applyHttpSecurity(app, {
   allowedOrigins: process.env.ALLOWED_ORIGINS || "",
   nodeEnv: NODE_ENV,
 });
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json({ limit: "3mb" }));
 
 const PORT = process.env.PORT || 8080;
 
@@ -92,6 +120,10 @@ const firebaseAdminServices = getFirebaseAdminServices({
 const requireFirebaseAuth = createRequireFirebaseAuth(
   firebaseAdminServices.auth
 );
+const requireProSubscription = createCanonicalPlanAuthorizer({
+  firestore: firebaseAdminServices.firestore,
+  requiredPlan: "pro",
+});
 const plaidStore = createPlaidStore(
   firebaseAdminServices.firestore,
   firebaseAdminServices.admin
@@ -106,6 +138,10 @@ const aiCopilotStore = createAICopilotStore({
 const taxStore = createTaxStore({
   firestore: firebaseAdminServices.firestore,
   admin: firebaseAdminServices.admin,
+});
+const verifyGooglePlaySubscription = createGooglePlaySubscriptionVerifier({
+  serviceAccountBase64: process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || "",
+  packageName: process.env.GOOGLE_PLAY_PACKAGE_NAME || "com.dany.gigprofit",
 });
 
 // --------------------------------------------------
@@ -123,6 +159,7 @@ const aiCopilotRouterBundle = createAICopilotRouter({
   hasOpenAIKey,
   logger: console,
   config: aiCopilotConfig,
+  requirePlanAccess: requireProSubscription,
 });
 
 // --------------------------------------------------
@@ -133,6 +170,7 @@ const plaidClient = new PlaidApi(
   new Configuration({
     basePath: resolvedPlaidEnvironment,
     baseOptions: {
+      timeout: 12_000,
       headers: {
         "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID || "",
         "PLAID-SECRET": process.env.PLAID_SECRET || "",
@@ -146,6 +184,7 @@ const plaidRouter = createPlaidRouter({
   hasPlaidKeys,
   plaidEnvironment: PLAID_ENV_RAW,
   requireFirebaseAuth,
+  requirePlanAccess: requireProSubscription,
   store: plaidStore,
   encryptionKey: plaidEncryptionKey,
   encryptSecret,
@@ -444,7 +483,7 @@ function buildDynamicExpected({
 // TICKETMASTER
 // --------------------------------------------------
 
-async function getNearbyEvents(city) {
+async function getNearbyEvents(city, trustedRange) {
   const apiKey = process.env.TICKETMASTER_API_KEY;
 
   if (!apiKey) return [];
@@ -454,8 +493,10 @@ async function getNearbyEvents(city) {
       `https://app.ticketmaster.com/discovery/v2/events.json` +
       `?apikey=${apiKey}` +
       `&city=${encodeURIComponent(city)}` +
-      `&size=8` +
-      `&sort=date,asc`;
+      `&size=20` +
+      `&sort=date,asc` +
+      (trustedRange?.startDateTime ? `&startDateTime=${encodeURIComponent(trustedRange.startDateTime)}` : "") +
+      (trustedRange?.endDateTime ? `&endDateTime=${encodeURIComponent(trustedRange.endDateTime)}` : "");
 
     const response = await fetch(url);
 
@@ -682,7 +723,7 @@ app.get("/health", (req, res) => {
 // COMMUNITY
 // --------------------------------------------------
 
-app.post("/community/report", (req, res) => {
+app.post("/community/report", requireFirebaseAuth, (req, res) => {
   try {
     const { city, zone, pay, miles, minutes, source = "scan" } = req.body || {};
 
@@ -734,41 +775,76 @@ app.post("/community/report", (req, res) => {
 // AI ASSISTANT
 // --------------------------------------------------
 
-app.post("/ask", aiCopilotRouterBundle.legacyAskHandler);
+app.post(
+  "/ask",
+  requireFirebaseAuth,
+  requireProSubscription,
+  createAICopilotRateLimiter(),
+  aiCopilotRouterBundle.legacyAskHandler
+);
 
 // --------------------------------------------------
 // RADAR
 // --------------------------------------------------
 
-app.post("/radar/recommend", async (req, res) => {
+app.post(
+  "/radar/recommend",
+  requireFirebaseAuth,
+  createAICopilotRateLimiter(),
+  async (req, res) => {
   try {
     if (!hasOpenAIKey) {
       return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
     }
 
     const {
-      city = "Charlotte",
+      city = "Current Area",
       latitude,
       longitude,
-      hour,
+      timezoneIdentifier,
       mode = "manual",
     } = req.body || {};
 
-    const resolvedHour =
-      typeof hour === "number" && hour >= 0 && hour <= 23
-        ? hour
-        : new Date().getHours();
+    const trustedTime = await resolveTrustedTimeContext({
+      latitude: Number.isFinite(latitude) ? latitude : undefined,
+      longitude: Number.isFinite(longitude) ? longitude : undefined,
+      timezoneIdentifier,
+      apiKey: process.env.GOOGLE_MAPS_API_KEY || "",
+      logger: console,
+    });
+    const resolvedHour = Number(trustedTime.localTime.slice(0, 2));
+    const trustedRange = interpretTrustedEventRange(trustedTime, {
+      period: "upcoming",
+      daysAhead: 2,
+    });
 
-    const cityZones = getCityZones(city);
-    const events = await getNearbyEvents(city);
-
-    let referenceLat = cityZones[0]?.lat ?? 35.2271;
-    let referenceLon = cityZones[0]?.lon ?? -80.8431;
-
-    if (typeof latitude === "number" && typeof longitude === "number") {
-      referenceLat = latitude;
-      referenceLon = longitude;
+    if (!isValidCoordinate(latitude, longitude)) {
+      return res.status(400).json({
+        error: "Radar requires valid latitude and longitude for nationwide recommendations",
+      });
     }
+
+    const referenceLat = latitude;
+    const referenceLon = longitude;
+    const radarRadiusMiles = normalizeRadiusMiles(
+      Number(req.body?.radiusMiles || DEFAULT_RADAR_RADIUS_MILES)
+    );
+    const cityZones = await discoverNationwideZones({
+      city,
+      latitude: referenceLat,
+      longitude: referenceLon,
+      radiusMiles: radarRadiusMiles,
+      apiKey: process.env.GOOGLE_MAPS_API_KEY || "",
+      logger: console,
+    });
+    const events = await getNationwideEvents({
+      latitude: referenceLat,
+      longitude: referenceLon,
+      radiusMiles: radarRadiusMiles,
+      trustedRange,
+      apiKey: process.env.TICKETMASTER_API_KEY || "",
+      logger: console,
+    });
 
     const scoredZones = await Promise.all(
       cityZones.map(async (zone) => {
@@ -794,42 +870,72 @@ app.post("/radar/recommend", async (req, res) => {
         }
 
         let eventBoost = 0;
+        let eventEarningsBoost = 0;
         const nearbyEvents = [];
+        const eventReasons = [];
 
         for (const event of events) {
           if (typeof event.lat !== "number" || typeof event.lon !== "number") continue;
-
           const eventDistance = distanceMiles(zone.lat, zone.lon, event.lat, event.lon);
-
-          if (eventDistance < 2) {
-            eventBoost += 12;
-            nearbyEvents.push(event.name);
-          } else if (eventDistance < 5) {
-            eventBoost += 6;
-            nearbyEvents.push(event.name);
-          }
+          const impact = eventDemandImpact({
+            event,
+            zoneLat: zone.lat,
+            zoneLon: zone.lon,
+            nowLocalDate: trustedTime.localDate,
+            nowLocalTime: trustedTime.localTime,
+            distanceMiles: eventDistance,
+          });
+          if (!impact.active) continue;
+          eventBoost += impact.scoreBoost;
+          eventEarningsBoost += impact.earningsBoost;
+          nearbyEvents.push(event.name);
+          if (impact.reason) eventReasons.push(impact.reason);
         }
 
+        eventBoost = Math.min(eventBoost, 8);
+        eventEarningsBoost = Math.min(eventEarningsBoost, 3.5);
+
         const level = trafficLevel(driveMinutes);
-        const bonus = timeBonus(zone.type, resolvedHour);
+        const temporalProfile = timeDemandProfile({
+          zoneType: zone.type,
+          hour: resolvedHour,
+          dayOfWeek: trustedTime.dayOfWeek,
+        });
         const community = getCommunitySnapshot(city, zone.name);
 
-        const dynamicExpected = buildDynamicExpected({
+        const dynamicExpected = buildRadarMarketEstimate({
           baseExpectedText: zone.expected,
-          trafficLevelValue: level,
-          timeBonusPoints: bonus,
-          eventBoost,
+          trafficLevel: level,
+          timeProfile: temporalProfile,
+          totalEventEarningsBoost: eventEarningsBoost,
           community,
+          zoneType: zone.type,
+          activityEvidence: zone.activityEvidence,
         });
 
-        const finalScore = Math.max(
-          1,
-          zone.baseScore +
-            bonus +
-            eventBoost -
-            distancePenalty(miles) -
-            trafficPenaltyFromMinutes(driveMinutes)
-        );
+        const demandScore = evidenceAdjustedRadarScore({
+          baseScore: zone.baseScore,
+          timeBonus: temporalProfile.scoreBonus,
+          eventBoost,
+          distancePenalty: 0,
+          trafficPenalty: Math.round(trafficPenaltyFromMinutes(driveMinutes) * 0.45),
+          community,
+          liveTraffic,
+          activityEvidence: zone.activityEvidence,
+          zoneConfidence: zone.zoneConfidence,
+        });
+        const opportunityScore = evidenceAdjustedRadarScore({
+          baseScore: zone.baseScore,
+          timeBonus: temporalProfile.scoreBonus,
+          eventBoost,
+          distancePenalty: distancePenalty(miles),
+          trafficPenalty: trafficPenaltyFromMinutes(driveMinutes),
+          community,
+          liveTraffic,
+          activityEvidence: zone.activityEvidence,
+          zoneConfidence: zone.zoneConfidence,
+        });
+        const finalScore = opportunityScore;
 
         return {
           city: zone.city,
@@ -845,12 +951,26 @@ app.post("/radar/recommend", async (req, res) => {
           trafficLevel: level,
           liveTraffic,
           finalScore,
+          demandScore,
+          opportunityScore,
+          zoneRadiusMiles: zone.zoneRadiusMiles,
+          zoneConfidence: zone.zoneConfidence,
+          activityEvidence: zone.activityEvidence,
+          activitySignals: zone.activitySignals,
+          zoneSource: zone.zoneSource,
           eventBoost,
           nearbyEvents: Array.from(new Set(nearbyEvents)).slice(0, 3),
+          eventReasons: Array.from(new Set(eventReasons)).slice(0, 3),
           expectedLow: dynamicExpected.expectedLow,
           expectedHigh: dynamicExpected.expectedHigh,
           expectedSource: dynamicExpected.expectedSource,
           expectedSampleCount: dynamicExpected.expectedSampleCount,
+          expectedConfidence: dynamicExpected.confidence,
+          expectedIsEstimate: dynamicExpected.isEstimate,
+          demandWindow: temporalProfile.label,
+          trustedLocalDate: trustedTime.localDate,
+          trustedLocalTime: trustedTime.localTime,
+          timezoneIdentifier: trustedTime.timezoneIdentifier,
           communityZoneCount: community.zoneCount,
           communityCityCount: community.cityCount,
           communityZoneAvgHourly: community.zoneAvgHourly,
@@ -859,26 +979,43 @@ app.post("/radar/recommend", async (req, res) => {
       })
     );
 
-    scoredZones.sort((a, b) => b.finalScore - a.finalScore);
+    if (!scoredZones.length) {
+      return res.status(503).json({
+        error: "No named radar districts were available within 15 miles",
+      });
+    }
+
+    scoredZones.sort((a, b) => {
+      if (b.opportunityScore !== a.opportunityScore) return b.opportunityScore - a.opportunityScore;
+      if (b.demandScore !== a.demandScore) return b.demandScore - a.demandScore;
+      return a.distanceMiles - b.distanceMiles;
+    });
+    const topZones = scoredZones.slice(0, 8);
 
     const aiPrompt = `
 You are GigProfit Radar AI for Uber and Lyft drivers.
 
 User city: ${city}
 Mode: ${mode}
-Current hour: ${resolvedHour}
+Verified local date: ${trustedTime.localDate}
+Verified local time: ${trustedTime.localTime}
+Verified day: ${trustedTime.dayOfWeek}
+Time zone: ${trustedTime.timezoneIdentifier}
 
-Live events nearby:
+Live events relevant to the next two days:
 ${formatEventSummary(events)}
 
-Top candidate zones:
-${scoredZones
-  .slice(0, 3)
+Top named neighborhoods and districts within ${radarRadiusMiles} miles:
+${topZones
+  .slice(0, 5)
   .map(
     (z, i) => `
 ${i + 1}. ${z.name}
 type: ${z.type}
-score: ${z.finalScore}
+opportunity score: ${z.opportunityScore}
+demand score: ${z.demandScore}
+district confidence: ${z.zoneConfidence}
+activity evidence: ${z.activityEvidence}
 distance: ${z.distanceMiles} miles
 drive time: ${z.driveMinutes} min
 traffic level: ${z.trafficLevel}
@@ -895,6 +1032,10 @@ community city avg hourly: ${z.communityCityAvgHourly ?? "n/a"}
   .join("\n")}
 
 Write a short driver-friendly recommendation in plain English.
+Recommend only the named neighborhood or district, never a venue, business, stadium, mall, or restaurant as the Radar zone.
+Ticketmaster events are separate nearby signals that may moderately affect a district score.
+The earnings ranges are estimates produced by GigProfit from market baselines, recent community reports when available, verified local day/time, traffic, neighborhood activity density, and time-relevant Ticketmaster events.
+Do not invent surge, exact demand, attendance, event end time, or guaranteed earnings.
 
 Format exactly like this:
 
@@ -933,8 +1074,16 @@ Recommendation:
       city,
       mode,
       hour: resolvedHour,
-      bestZone: scoredZones[0],
-      zones: scoredZones,
+      trustedTime: {
+        localDate: trustedTime.localDate,
+        localTime: trustedTime.localTime,
+        dayOfWeek: trustedTime.dayOfWeek,
+        timezoneIdentifier: trustedTime.timezoneIdentifier,
+        source: trustedTime.source,
+      },
+      radiusMiles: radarRadiusMiles,
+      bestZone: topZones[0],
+      zones: topZones,
       explanation,
       events: events.slice(0, 5),
       communityReportsInMemory: communityReports.length,
@@ -1057,12 +1206,12 @@ function getOfflineStatePack(stateCode = "NC") {
     }
   };
 
-  return statePacks[code] || statePacks["NC"];
+  return statePacks[code] || genericOfflineStatePack(code);
 }
 
 app.get("/offline/state-pack", async (req, res) => {
   try {
-    const state = req.query.state || "NC";
+    const state = req.query.state || "US";
 
     const pack = getOfflineStatePack(state);
 
@@ -1110,9 +1259,197 @@ app.delete("/account", requireFirebaseAuth, async (req, res) => {
   }
 });
 
+app.post("/subscription/sync", requireFirebaseAuth, async (req, res) => {
+  const source = String(req.body?.source || "").trim().toLowerCase();
+  const requestedPlan = String(req.body?.plan || "").trim().toLowerCase();
+
+  if (source === "google_play") {
+    const productId = String(req.body?.productId || "").trim();
+    const purchaseToken = String(req.body?.purchaseToken || "").trim();
+
+    try {
+      const verified = await verifyGooglePlaySubscription({
+        productId,
+        purchaseToken,
+      });
+      const tokenHash = hashGooglePlayPurchaseToken(purchaseToken);
+      const users = firebaseAdminServices.firestore.collection("users");
+      const existing = await users
+        .where("googlePlayPurchaseTokenHash", "==", tokenHash)
+        .limit(1)
+        .get();
+
+      if (!existing.empty && existing.docs[0].id !== req.auth.uid) {
+        return res.status(409).json({
+          ok: false,
+          error: "This Google Play purchase is already linked to another account.",
+        });
+      }
+
+      const now = firebaseAdminServices.admin.firestore.FieldValue.serverTimestamp();
+      await users.doc(req.auth.uid).set({
+        plan: verified.plan,
+        subscriptionStatus: "active",
+        subscriptionSource: "google-play-verified",
+        subscriptionProductId: verified.productId,
+        subscriptionExpiresAt: verified.expiryTime,
+        googlePlayPurchaseTokenHash: tokenHash,
+        subscriptionUpdatedAt: now,
+      }, { merge: true });
+
+      return res.json({
+        ok: true,
+        plan: verified.plan,
+        productId: verified.productId,
+        expiresAt: verified.expiryTime,
+      });
+    } catch (error) {
+      console.error("Google Play subscription verification failed", {
+        uid: req.auth.uid,
+        productId,
+        message: error?.message || String(error),
+        status: error?.status || null,
+      });
+      return res.status(error?.status === 429 ? 503 : 400).json({
+        ok: false,
+        error: error?.message || "Google Play could not verify this subscription.",
+      });
+    }
+  }
+
+  if (source !== "storekit-verified-jws") {
+    return res.status(400).json({
+      ok: false,
+      error: "Unsupported entitlement",
+    });
+  }
+
+  let verified;
+  try {
+    verified = verifyAppleStoreKitTransaction({
+      signedTransactionInfo: req.body?.signedTransactionInfo,
+      uid: req.auth.uid,
+      allowInactive: true,
+    });
+  } catch (error) {
+    console.error("StoreKit transaction verification failed", {
+      uid: req.auth.uid,
+      productId: req.body?.productId || null,
+      message: error?.message || String(error),
+    });
+    return res.status(400).json({
+      ok: false,
+      code: "INVALID_STOREKIT_TRANSACTION",
+      error_type: "purchase_verification",
+      error: error?.message || "Could not verify StoreKit subscription",
+    });
+  }
+
+  if (requestedPlan && requestedPlan !== verified.plan) {
+    return res.status(400).json({
+      ok: false,
+      code: "STOREKIT_PLAN_MISMATCH",
+      error_type: "purchase_verification",
+      error: "Requested plan does not match the verified StoreKit product.",
+    });
+  }
+
+  try {
+    const ownership = await claimAppleSubscriptionOwnership({
+      firestore: firebaseAdminServices.firestore,
+      adminFirestore: firebaseAdminServices.admin.firestore,
+      uid: req.auth.uid,
+      verified,
+    });
+
+    return res.json({
+      ok: true,
+      plan: verified.status === "active" ? verified.plan : "free",
+      productId: verified.productId,
+      expiresAt: verified.expiresAt,
+      originalTransactionId: verified.originalTransactionId,
+      ownership: ownership.claimed ? "claimed" : "owned",
+      status: verified.status,
+    });
+  } catch (error) {
+    console.error("Subscription entitlement sync failed", {
+      uid: req.auth.uid,
+      productId: req.body?.productId || null,
+      message: error?.message || String(error),
+    });
+
+    if (error?.code === APPLE_SUBSCRIPTION_OWNERSHIP_CONFLICT) {
+      return res.status(409).json({
+        ok: false,
+        code: APPLE_SUBSCRIPTION_OWNERSHIP_CONFLICT,
+        error: error.message,
+        message: error.message,
+      });
+    }
+
+    return res.status(503).json({
+      ok: false,
+      code: "SUBSCRIPTION_SYNC_TEMPORARY_FAILURE",
+      error_type: "temporary_backend_failure",
+      error: "The verified purchase could not be synchronized yet.",
+      message: "The verified purchase could not be synchronized yet.",
+    });
+  }
+});
+
+app.get("/subscription/status", requireFirebaseAuth, async (req, res) => {
+  try {
+    const subscription = await readCanonicalSubscription({
+      firestore: firebaseAdminServices.firestore,
+      uid: req.auth.uid,
+    });
+
+    return res.json({
+      ok: true,
+      plan: subscription.plan,
+      status: subscription.status,
+      source: subscription.source,
+      expiresAt: subscription.expiresAt,
+      productId: subscription.productId,
+      originalTransactionId: subscription.originalTransactionId,
+    });
+  } catch (error) {
+    console.error("Subscription status read failed", {
+      uid: req.auth.uid,
+      message: error?.message || String(error),
+    });
+    return res.status(503).json({
+      ok: false,
+      code: "SUBSCRIPTION_BACKEND_UNAVAILABLE",
+      error_type: "temporary_backend_failure",
+      message: "Subscription status is temporarily unavailable.",
+    });
+  }
+});
+
 app.use("/plaid", createPlaidRateLimiter(), plaidRouter);
+app.use("/events", createAICopilotRateLimiter(), createEventRouter({ apiKey: process.env.TICKETMASTER_API_KEY, logger: console }));
+app.use(
+  "/maps",
+  createAICopilotRateLimiter(),
+  requireFirebaseAuth,
+  createDriverMapRouter({
+    apiKey: process.env.GOOGLE_MAPS_API_KEY || "",
+    logger: console,
+  })
+);
 app.use("/ai", requireFirebaseAuth, aiCopilotRouterBundle.router);
-app.use("/tax", requireFirebaseAuth, taxRouter);
+app.use(
+  "/ai",
+  requireFirebaseAuth,
+  createUniversalOrderScanRouter({
+    openaiClient: client,
+    hasOpenAIKey,
+    usageStore: createOrderScanUsageStore({ firestore: firebaseAdminServices.firestore, admin: firebaseAdminServices.admin }),
+    logger: console,
+  })
+);
+app.use("/tax", requireFirebaseAuth, requireProSubscription, taxRouter);
 
 // --------------------------------------------------
 // START
