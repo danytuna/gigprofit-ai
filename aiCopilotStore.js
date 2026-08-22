@@ -1,4 +1,8 @@
 import crypto from "node:crypto";
+import {
+  createDefaultConversationState,
+  sanitizeConversationState,
+} from "./conversationState.js";
 
 function nowISO() {
   return new Date().toISOString();
@@ -57,6 +61,37 @@ function sanitizeConversationTitle(title) {
     .trim();
 }
 
+function normalizeToolContext(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const tool = normalizeText(value.tool, 40);
+  if (!tool) {
+    return null;
+  }
+
+  const cleanRecord = (record, maxEntries = 20) => Object.fromEntries(
+    Object.entries(record && typeof record === "object" ? record : {})
+      .slice(0, maxEntries)
+      .map(([key, item]) => [
+        normalizeText(key, 60),
+        typeof item === "number" || typeof item === "boolean"
+          ? item
+          : normalizeText(item, 500),
+      ])
+      .filter(([key]) => key)
+  );
+
+  return {
+    tool,
+    parameters: cleanRecord(value.parameters),
+    results: cleanRecord(value.results),
+    timestamp: normalizeText(value.timestamp, 60) || nowISO(),
+    conversationContext: normalizeText(value.conversationContext, 1000),
+  };
+}
+
 function createDefaultProfile(config = {}) {
   return {
     saveChatHistory: true,
@@ -75,7 +110,7 @@ function createDefaultProfile(config = {}) {
 function mapPlanToDailyLimit(plan, config) {
   switch (String(plan || "free").toLowerCase()) {
     case "pro":
-      return config.dailyProLimit;
+      return Number.POSITIVE_INFINITY;
     case "standard":
       return config.dailyStandardLimit;
     default:
@@ -99,6 +134,7 @@ function filterConversationForList(conversation) {
     language: conversation.language,
     source: conversation.source,
     lastResponseId: conversation.lastResponseId || null,
+    conversationState: sanitizeConversationState(conversation.conversationState),
     schemaVersion: conversation.schemaVersion || 1,
   };
 }
@@ -113,6 +149,7 @@ function filterMessage(message) {
     model: message.model || null,
     source: message.source || null,
     toolNames: Array.isArray(message.toolNames) ? message.toolNames : [],
+    toolContext: normalizeToolContext(message.toolContext),
     errorCode: message.errorCode || null,
     tokenUsage: message.tokenUsage || null,
     schemaVersion: message.schemaVersion || 1,
@@ -173,14 +210,23 @@ class InMemoryAICopilotStore {
 
   async incrementDailyUsage(uid, plan = "free") {
     const user = this.ensureUser(uid);
+
+    const limit = mapPlanToDailyLimit(plan, this.config);
+
+    if (limit === Number.POSITIVE_INFINITY) {
+      return {
+        allowed: true,
+        limit,
+        used: Number(user.profile.dailyMessageCount || 0),
+      };
+    }
+
     const today = new Date().toISOString().slice(0, 10);
 
     if (user.profile.dailyMessageDate !== today) {
       user.profile.dailyMessageDate = today;
       user.profile.dailyMessageCount = 0;
     }
-
-    const limit = mapPlanToDailyLimit(plan, this.config);
 
     if (user.profile.dailyMessageCount >= limit) {
       return {
@@ -217,6 +263,7 @@ class InMemoryAICopilotStore {
       language: data.language || "en",
       source: data.source || "gigprofit-ios",
       lastResponseId: null,
+      conversationState: createDefaultConversationState(),
       schemaVersion: 1,
     };
 
@@ -270,6 +317,9 @@ class InMemoryAICopilotStore {
       ...current,
       ...patch,
       title: patch.title !== undefined ? sanitizeConversationTitle(patch.title) || current.title : current.title,
+      conversationState: patch.conversationState !== undefined
+        ? sanitizeConversationState(patch.conversationState)
+        : current.conversationState,
       updatedAt: nowISO(),
     };
 
@@ -300,6 +350,7 @@ class InMemoryAICopilotStore {
     user.messages.set(conversationId, []);
     current.messageCount = 0;
     current.summary = "";
+    current.conversationState = createDefaultConversationState();
     current.summaryUpdatedAt = nowISO();
     current.updatedAt = current.summaryUpdatedAt;
     current.lastMessageAt = current.updatedAt;
@@ -350,6 +401,7 @@ class InMemoryAICopilotStore {
       model: message.model || null,
       source: message.source || "gigprofit-ai",
       toolNames: Array.isArray(message.toolNames) ? message.toolNames.slice(0, 20) : [],
+      toolContext: normalizeToolContext(message.toolContext),
       errorCode: message.errorCode || null,
       tokenUsage: message.tokenUsage || null,
       schemaVersion: 1,
@@ -380,11 +432,13 @@ class InMemoryAICopilotStore {
     return filterConversationForList(current);
   }
 
-  async listMemories(uid) {
+  async listMemories(uid, options = {}) {
     const user = this.ensureUser(uid);
+    const limit = clampInteger(options.limit, 1, 100, 20);
     return Array.from(user.memories.values())
       .filter((item) => item.active !== false)
       .sort((a, b) => compareISODesc(a.updatedAt, b.updatedAt))
+      .slice(0, limit)
       .map(filterMemory);
   }
 
@@ -519,8 +573,17 @@ class FirestoreAICopilotStore {
 
   async incrementDailyUsage(uid, plan = "free") {
     const profile = await this.getProfile(uid);
-    const today = new Date().toISOString().slice(0, 10);
     const limit = mapPlanToDailyLimit(plan, this.config);
+
+    if (limit === Number.POSITIVE_INFINITY) {
+      return {
+        allowed: true,
+        limit,
+        used: Number(profile.dailyMessageCount || 0),
+      };
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
     const current = profile.dailyMessageDate === today
       ? Number(profile.dailyMessageCount || 0)
       : 0;
@@ -553,6 +616,7 @@ class FirestoreAICopilotStore {
       language: data.language || "en",
       source: data.source || "gigprofit-ios",
       lastResponseId: null,
+      conversationState: createDefaultConversationState(),
       schemaVersion: 1,
     };
 
@@ -616,6 +680,9 @@ class FirestoreAICopilotStore {
     await this.conversationRef(uid, conversationId).set({
       ...patch,
       title: patch.title !== undefined ? sanitizeConversationTitle(patch.title) || current.title : current.title,
+      conversationState: patch.conversationState !== undefined
+        ? sanitizeConversationState(patch.conversationState)
+        : current.conversationState,
       updatedAt: this.admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
@@ -657,6 +724,7 @@ class FirestoreAICopilotStore {
     batch.set(this.conversationRef(uid, conversationId), {
       messageCount: 0,
       summary: "",
+      conversationState: createDefaultConversationState(),
       summaryUpdatedAt: this.admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: this.admin.firestore.FieldValue.serverTimestamp(),
       lastMessageAt: this.admin.firestore.FieldValue.serverTimestamp(),
@@ -711,6 +779,7 @@ class FirestoreAICopilotStore {
       model: message.model || null,
       source: message.source || "gigprofit-ai",
       toolNames: Array.isArray(message.toolNames) ? message.toolNames.slice(0, 20) : [],
+      toolContext: normalizeToolContext(message.toolContext),
       errorCode: message.errorCode || null,
       tokenUsage: message.tokenUsage || null,
       schemaVersion: 1,
@@ -747,10 +816,12 @@ class FirestoreAICopilotStore {
     return this.getConversation(uid, conversationId);
   }
 
-  async listMemories(uid) {
+  async listMemories(uid, options = {}) {
+    const limit = clampInteger(options.limit, 1, 100, 20);
     const snapshot = await this.memoriesRef(uid)
       .where("active", "==", true)
       .orderBy("updatedAt", "desc")
+      .limit(limit)
       .get();
 
     return snapshot.docs.map((doc) => filterMemory({

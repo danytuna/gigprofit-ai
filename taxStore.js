@@ -119,6 +119,9 @@ function normalizeTransactionRecord(record = {}) {
     updatedAt: normalizeDateValue(record.updatedAt, nowIso()),
     schemaVersion: Number(record.schemaVersion || 1),
     isIncome: Boolean(record.isIncome),
+    transactionType: ["income", "expense", "transfer", "refund"].includes(record.transactionType)
+      ? record.transactionType
+      : record.isIncome ? "income" : record.classification === "excluded" ? "transfer" : "expense",
     reviewId: record.reviewId || null,
     flags: Array.isArray(record.flags) ? record.flags : [],
     merchantKey: record.merchantKey || null,
@@ -146,15 +149,49 @@ function normalizeRuleRecord(rule = {}) {
 }
 
 function normalizeReviewRecord(review = {}) {
+  const progress = review.progress && typeof review.progress === "object" ? review.progress : {};
+  const progressPercent = Number.isFinite(Number(review.progressPercent))
+    ? Number(review.progressPercent)
+    : Number.isFinite(Number(progress.progressPercent))
+    ? Number(progress.progressPercent)
+    : 0;
+  const processedTransactions = Number.isFinite(Number(review.processedTransactions))
+    ? Number(review.processedTransactions)
+    : Number.isFinite(Number(progress.processed))
+    ? Number(progress.processed)
+    : 0;
+  const totalTransactions = Number.isFinite(Number(review.totalTransactions))
+    ? Number(review.totalTransactions)
+    : Number.isFinite(Number(progress.total))
+    ? Number(progress.total)
+    : 0;
+  const processedBatches = Number.isFinite(Number(review.processedBatches))
+    ? Number(review.processedBatches)
+    : 0;
+  const totalBatches = Number.isFinite(Number(review.totalBatches))
+    ? Number(review.totalBatches)
+    : 0;
+
   return {
     id: String(review.id || generateId("review")),
     year: normalizeYear(review.year),
     mode: review.mode || "unreviewed",
     status: review.status || "queued",
+    currentPhase: review.currentPhase || progress.stage || null,
+    progressPercent,
+    processedTransactions,
+    totalTransactions,
+    processedBatches,
+    totalBatches,
     autoApplyHighConfidence: Boolean(review.autoApplyHighConfidence),
     selectedTransactionIds: Array.isArray(review.selectedTransactionIds) ? review.selectedTransactionIds : [],
+    transactionSetHash: review.transactionSetHash || null,
+    sourceYear: Number.isFinite(Number(review.sourceYear)) ? Number(review.sourceYear) : null,
+    sourceAccountCount: Number.isFinite(Number(review.sourceAccountCount)) ? Number(review.sourceAccountCount) : null,
+    heartbeatAt: normalizeDateValue(review.heartbeatAt, normalizeDateValue(review.updatedAt, nowIso())),
+    reusedExistingReview: Boolean(review.reusedExistingReview),
     summary: review.summary || {},
-    progress: review.progress || {},
+    progress,
     suggestions: Array.isArray(review.suggestions) ? review.suggestions : [],
     counts: review.counts || {},
     createdAt: normalizeDateValue(review.createdAt, nowIso()),

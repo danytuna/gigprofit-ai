@@ -208,6 +208,7 @@ export function createPlaidRouter({
   hasPlaidKeys,
   plaidEnvironment,
   requireFirebaseAuth,
+  requirePlanAccess = (_req, _res, next) => next(),
   store,
   encryptionKey,
   encryptSecret,
@@ -293,6 +294,7 @@ export function createPlaidRouter({
   });
 
   router.use(requireFirebaseAuth);
+  router.use(requirePlanAccess);
 
   router.post("/create_link_token", async (req, res) => {
     try {
@@ -300,6 +302,18 @@ export function createPlaidRouter({
         return res.status(500).json({
           ok: false,
           error: "Plaid is not configured on the server.",
+        });
+      }
+
+      const platform = String(req.body?.platform || "").trim().toLowerCase();
+      const androidPackageName = String(
+        process.env.PLAID_ANDROID_PACKAGE_NAME || ""
+      ).trim();
+
+      if (platform === "android" && !androidPackageName) {
+        return res.status(503).json({
+          ok: false,
+          error: "Plaid Android is not configured on the server.",
         });
       }
 
@@ -311,6 +325,9 @@ export function createPlaidRouter({
         products: ["transactions"],
         country_codes: ["US"],
         language: "en",
+        ...(platform === "android"
+          ? { android_package_name: androidPackageName }
+          : {}),
       });
 
       return res.json({
@@ -447,15 +464,38 @@ export function createPlaidRouter({
       const results = await Promise.all(
         items.map(async (item) => {
           const accessToken = decryptSecret(item, encryptionKey);
-          const response = await plaidClient.transactionsGet({
-            access_token: accessToken,
-            start_date: range.startDate,
-            end_date: range.endDate,
-          });
+          const pageSize = 500;
+          let offset = 0;
+          let totalTransactions = Infinity;
+          const allTransactions = [];
+
+          while (offset < totalTransactions) {
+            const response = await plaidClient.transactionsGet({
+              access_token: accessToken,
+              start_date: range.startDate,
+              end_date: range.endDate,
+              count: pageSize,
+              offset,
+            });
+
+            const pageTransactions = response.data.transactions || [];
+            totalTransactions = Number(response.data.total_transactions || pageTransactions.length);
+            allTransactions.push(...pageTransactions);
+
+            if (!pageTransactions.length) {
+              break;
+            }
+
+            offset += pageTransactions.length;
+
+            if (pageTransactions.length < pageSize) {
+              break;
+            }
+          }
 
           return {
             item,
-            transactions: response.data.transactions || [],
+            transactions: allTransactions,
           };
         })
       );

@@ -1,8 +1,16 @@
+import crypto from "node:crypto";
 import express from "express";
 import rateLimit from "express-rate-limit";
 
 import { normalizeYear } from "./taxStore.js";
-import { buildTaxConfigFromEnv, deterministicSuggestion, nextReviewId, runTaxAiReview } from "./taxAiService.js";
+import {
+  buildReviewProgressRecord,
+  buildTaxConfigFromEnv,
+  deterministicSuggestion,
+  nextReviewId,
+  runTaxAiReview,
+  REVIEW_STATUS,
+} from "./taxAiService.js";
 
 function createTaxRateLimiter() {
   return rateLimit({
@@ -216,6 +224,7 @@ function buildTransactionResponse(record) {
     updatedAt: record.updatedAt,
     schemaVersion: record.schemaVersion,
     isIncome: record.isIncome,
+    transactionType: record.transactionType,
     flags: record.flags,
   });
 }
@@ -224,13 +233,26 @@ function buildReviewResponse(review, taxCenterCounts = null) {
   const summary = review?.summary && typeof review.summary === "object" ? review.summary : {};
   const counts = review?.counts && typeof review.counts === "object" ? review.counts : {};
   const suggestions = Array.isArray(review?.suggestions) ? review.suggestions : [];
-  const progress = review?.progress && typeof review.progress === "object"
+  const progressMeta = review?.progress && typeof review.progress === "object" ? review.progress : {};
+  const totalTransactions = Number(review?.totalTransactions ?? progressMeta.total ?? summary.total ?? 0);
+  const processedTransactions = Number(review?.processedTransactions ?? progressMeta.processed ?? 0);
+  const totalBatches = Number(review?.totalBatches ?? 0);
+  const processedBatches = Number(review?.processedBatches ?? 0);
+  const storedProgressPercent = Number(review?.progressPercent);
+  const computedProgressPercent = totalTransactions > 0
+    ? Math.min(100, Math.round((processedTransactions / totalTransactions) * 100))
+    : 0;
+  const progressPercent = Number.isFinite(storedProgressPercent) && storedProgressPercent > 0
+    ? storedProgressPercent
+    : computedProgressPercent;
+  const currentPhase = review?.currentPhase || progressMeta.stage || null;
+  const progress = progressMeta
     ? compactObject({
-        stage: review.progress.stage,
-        stageIndex: review.progress.stageIndex,
-        totalStages: review.progress.totalStages,
-        processed: review.progress.processed,
-        total: review.progress.total,
+        stage: progressMeta.stage,
+        stageIndex: progressMeta.stageIndex,
+        totalStages: progressMeta.totalStages,
+        processed: progressMeta.processed,
+        total: progressMeta.total,
       })
     : null;
 
@@ -240,13 +262,25 @@ function buildReviewResponse(review, taxCenterCounts = null) {
     year: Number(review?.year || new Date().getUTCFullYear()),
     mode: review?.mode || "unreviewed",
     status: review?.status || "queued",
+    currentPhase,
+    progressPercent,
+    processedTransactions,
+    totalTransactions,
+    processedBatches,
+    totalBatches,
     selectedTransactionIds: Array.isArray(review?.selectedTransactionIds) ? review.selectedTransactionIds : [],
     summary,
     counts,
-    transactionCount: Number(summary.total || progress?.total || 0),
+    transactionCount: Number(summary.total || totalTransactions || progress?.total || 0),
     suggestionCount: suggestions.length,
     suggestions,
     progress,
+    updatedAt: review?.updatedAt || null,
+    heartbeatAt: review?.heartbeatAt || review?.updatedAt || null,
+    transactionSetHash: review?.transactionSetHash || null,
+    sourceYear: review?.sourceYear ?? null,
+    sourceAccountCount: review?.sourceAccountCount ?? null,
+    reusedExistingReview: review?.reusedExistingReview ?? null,
     taxCenterCounts: taxCenterCounts || undefined,
     errorMessage: review?.errorMessage || null,
     errorCode: review?.errorCode || null,
@@ -255,14 +289,13 @@ function buildReviewResponse(review, taxCenterCounts = null) {
 
 function shouldReuseExistingReview(existingReview, taxCenterCounts) {
   if (!existingReview) return false;
-  if (["queued", "running", "preparing", "processing"].includes(existingReview.status)) {
-    return true;
+  if (!isActiveReviewStatus(existingReview.status)) return false;
+  if (isStalledReview(existingReview)) return false;
+  const updatedAt = Date.parse(existingReview.updatedAt || existingReview.createdAt || "");
+  if (Number.isFinite(updatedAt) && Date.now() - updatedAt > 5 * 60 * 1000) {
+    return false;
   }
-  if (["completed", "applied"].includes(existingReview.status)) {
-    const suggestionCount = Array.isArray(existingReview.suggestions) ? existingReview.suggestions.length : 0;
-    return suggestionCount > 0 || Number(taxCenterCounts?.aiEligibleTransactionCount || 0) === 0;
-  }
-  return false;
+  return true;
 }
 
 async function fetchPlaidTransactionsForUser({
@@ -356,7 +389,7 @@ function passesFilters(record, query = {}) {
 }
 
 function isNonIncomeExpense(transaction) {
-  return !transaction?.isIncome;
+  return !transaction?.isIncome && !["income", "transfer", "refund"].includes(transaction?.transactionType);
 }
 
 function isUnappliedAiSuggestion(transaction) {
@@ -382,6 +415,117 @@ function reviewSortValue(review) {
   return String(review?.updatedAt || review?.createdAt || "");
 }
 
+function maskIdentifier(value) {
+  const text = String(value || "").trim();
+  if (!text) return "unknown";
+  if (text.length <= 8) return text;
+  return `${text.slice(0, 4)}...${text.slice(-4)}`;
+}
+
+function transactionDedupeKey(record) {
+  return String(record?.pendingTransactionId || record?.plaidTransactionId || record?.id || "");
+}
+
+function transactionSortValue(record) {
+  return String(record?.updatedAt || record?.createdAt || record?.reviewedAt || "");
+}
+
+function choosePreferredTransaction(left, right) {
+  const leftScore = [
+    left?.userConfirmed ? 100 : 0,
+    left?.pending ? 0 : 50,
+    left?.classificationSource === "manual" ? 30 : 0,
+    left?.classificationSource === "user_rule" ? 20 : 0,
+    left?.classificationSource === "ai_suggestion" ? 10 : 0,
+    Date.parse(left?.updatedAt || left?.createdAt || "") || 0,
+  ].reduce((sum, value) => sum + value, 0);
+  const rightScore = [
+    right?.userConfirmed ? 100 : 0,
+    right?.pending ? 0 : 50,
+    right?.classificationSource === "manual" ? 30 : 0,
+    right?.classificationSource === "user_rule" ? 20 : 0,
+    right?.classificationSource === "ai_suggestion" ? 10 : 0,
+    Date.parse(right?.updatedAt || right?.createdAt || "") || 0,
+  ].reduce((sum, value) => sum + value, 0);
+
+  return rightScore > leftScore ? right : left;
+}
+
+function dedupeTransactions(records) {
+  const grouped = new Map();
+
+  for (const record of Array.isArray(records) ? records : []) {
+    const key = transactionDedupeKey(record);
+    if (!key) continue;
+    const existing = grouped.get(key);
+    grouped.set(key, existing ? choosePreferredTransaction(existing, record) : record);
+  }
+
+  return Array.from(grouped.values())
+    .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || transactionSortValue(right).localeCompare(transactionSortValue(left)));
+}
+
+function hashTransactionSet({ year, mode, selectedTransactionIds = [], transactions = [], sourceAccountCount = 0 }) {
+  const hash = crypto.createHash("sha256");
+  const transactionKeys = dedupeTransactions(transactions).map((transaction) => transactionDedupeKey(transaction));
+  hash.update([
+    `year:${year}`,
+    `mode:${mode}`,
+    `accounts:${sourceAccountCount}`,
+    `selected:${[...selectedTransactionIds].slice().sort().join("|")}`,
+    `transactions:${transactionKeys.join("|")}`,
+  ].join("\n"));
+  return hash.digest("hex");
+}
+
+function buildReviewDiagnostics({
+  review,
+  uid,
+  reusedExistingReview,
+  pollingReviewId = null,
+  activeReviewId = null,
+  sourceYear = null,
+  sourceAccountCount = null,
+  transactionSetHash = null,
+}) {
+  return {
+    reviewId: maskIdentifier(review?.id),
+    uid: maskIdentifier(uid),
+    status: review?.status || null,
+    currentPhase: review?.currentPhase || null,
+    processedTransactions: Number(review?.processedTransactions ?? 0),
+    totalTransactions: Number(review?.totalTransactions ?? 0),
+    processedBatches: Number(review?.processedBatches ?? 0),
+    totalBatches: Number(review?.totalBatches ?? 0),
+    progressPercent: Number(review?.progressPercent ?? 0),
+    createdAt: review?.createdAt || null,
+    updatedAt: review?.updatedAt || null,
+    transactionSetHash: transactionSetHash ? `${String(transactionSetHash).slice(0, 8)}...` : null,
+    sourceYear,
+    sourceAccountCount,
+    reusedExistingReview: Boolean(reusedExistingReview),
+    pollingReviewId: pollingReviewId ? maskIdentifier(pollingReviewId) : null,
+    activeReviewId: activeReviewId ? maskIdentifier(activeReviewId) : null,
+  };
+}
+
+function isActiveReviewStatus(status) {
+  return ["queued", "preparing", "processing", "running"].includes(String(status || "").toLowerCase());
+}
+
+function isStalledReview(review) {
+  if (!review || !isActiveReviewStatus(review.status)) {
+    return false;
+  }
+
+  const timestamp = Date.parse(review.updatedAt || review.createdAt || "");
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+
+  return Date.now() - timestamp > 5 * 60 * 1000;
+}
+
 function findLatestReviewForYear(reviews, year) {
   return (Array.isArray(reviews) ? reviews : [])
     .filter((review) => review?.year === year)
@@ -390,7 +534,7 @@ function findLatestReviewForYear(reviews, year) {
 
 function buildTaxCenterCounts(transactions, latestReview = null) {
   const expenseTransactions = (Array.isArray(transactions) ? transactions : []).filter(isNonIncomeExpense);
-  const processingReview = latestReview && ["queued", "preparing", "processing", "running"].includes(latestReview.status)
+  const processingReview = latestReview && isActiveReviewStatus(latestReview.status) && !isStalledReview(latestReview)
     ? latestReview
     : null;
 
@@ -399,7 +543,7 @@ function buildTaxCenterCounts(transactions, latestReview = null) {
     unreviewedTransactionCount: expenseTransactions.filter((transaction) => !transaction.userConfirmed).length,
     manualReviewCount: expenseTransactions.filter(isManualReviewTransaction).length,
     aiEligibleTransactionCount: expenseTransactions.filter(isAiEligibleTransaction).length,
-    aiReviewProcessingCount: Number(processingReview?.progress?.total || 0),
+    aiReviewProcessingCount: Number(processingReview?.processedTransactions ?? processingReview?.progress?.processed ?? 0),
     aiSuggestionCount: Array.isArray(latestReview?.suggestions)
       ? latestReview.suggestions.length
       : expenseTransactions.filter((transaction) => transaction.classificationSource === "ai_suggestion").length,
@@ -447,13 +591,25 @@ function buildSummary(transactions, threshold) {
 
   for (const transaction of transactions) {
     const value = Math.abs(Number(transaction.amount || 0));
-    if (transaction.isIncome) {
+    const transactionType = transaction.transactionType || (transaction.isIncome ? "income" : "expense");
+    const isExcludedType = transactionType === "transfer" || transactionType === "refund";
+    const isPending = transaction.pending === true;
+    const isReportableIncome = transactionType === "income" &&
+      transaction.classification !== "excluded" &&
+      transaction.classification !== "personal" &&
+      !isExcludedType &&
+      !isPending;
+    const isBusinessExpense = transactionType === "expense" &&
+      transaction.classification === "business" &&
+      !isPending;
+
+    if (isReportableIncome) {
       summary.totalIncome += value;
     }
 
     switch (transaction.classification) {
       case "business":
-        summary.totalBusiness += value;
+        if (isBusinessExpense) summary.totalBusiness += value;
         summary.counts.business += 1;
         break;
       case "personal":
@@ -470,8 +626,17 @@ function buildSummary(transactions, threshold) {
         break;
     }
 
-    if (transaction.deductibility === "deductible" || transaction.deductibility === "partially_deductible") {
-      summary.totalPotentiallyDeductible += value;
+    if (
+      transactionType === "expense" &&
+      !isPending &&
+      transaction.classification === "business" &&
+      transaction.userConfirmed &&
+      (transaction.deductibility === "deductible" || transaction.deductibility === "partially_deductible")
+    ) {
+      const percentage = transaction.deductibility === "partially_deductible"
+        ? Math.max(0, Math.min(100, Number(transaction.businessUsePercentage || 0))) / 100
+        : 1;
+      summary.totalPotentiallyDeductible += value * percentage;
       summary.counts.deductible += 1;
     }
 
@@ -498,6 +663,7 @@ function applyPatchToTransaction(current, patch) {
     ...current,
     ...compactObject({
       classification: patch.classification,
+      transactionType: patch.transactionType,
       deductibility: patch.deductibility,
       businessUsePercentage: patch.businessUsePercentage,
       taxCategory: patch.taxCategory,
@@ -576,7 +742,11 @@ export function createTaxRouter({
       const storedMap = new Map(storedTransactions.map((item) => [item.plaidTransactionId || item.id, item]));
 
       const merged = liveTransactions.map((transaction) => {
-        const existing = storedMap.get(transaction.plaidTransactionId) || storedMap.get(transaction.id);
+        const existing = storedMap.get(transaction.plaidTransactionId) || storedMap.get(transaction.id) || (
+          transaction.pendingTransactionId
+            ? storedMap.get(transaction.pendingTransactionId)
+            : null
+        );
         const pendingSource = transaction.pendingTransactionId
           ? storedMap.get(transaction.pendingTransactionId)
           : null;
@@ -614,19 +784,20 @@ export function createTaxRouter({
           updatedAt: seeded.updatedAt,
           flags: seeded.flags || [],
           lastAppliedRuleId: seeded.lastAppliedRuleId || null,
+          id: transaction.id,
+          plaidTransactionId: transaction.plaidTransactionId,
         });
       });
 
       await taxStore.bulkUpsertTransactions(req.auth.uid, merged);
-      const refreshed = (await taxStore.listTransactions(req.auth.uid))
+      const refreshed = dedupeTransactions((await taxStore.listTransactions(req.auth.uid))
         .filter((record) => new Date(record.date || "").getUTCFullYear() === year)
         .filter((record) => {
           if (replacedPendingIds.has(record.id) || replacedPendingIds.has(record.plaidTransactionId)) {
             return false;
           }
           return true;
-        })
-        .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+        }));
       const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
       const scopedTransactions = refreshed.filter((record) => passesFilters(record, req.query));
       const taxCenterCounts = buildTaxCenterCounts(refreshed, latestReview);
@@ -649,6 +820,36 @@ export function createTaxRouter({
         ok: false,
         error: "Failed to load tax transactions.",
       });
+    }
+  });
+
+  router.get("/transactions/duplicates/report", async (req, res) => {
+    try {
+      const year = normalizeYear(req.query.year);
+      const allTransactions = await taxStore.listTransactions(req.auth.uid);
+      const yearTransactions = allTransactions.filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      const grouped = new Map();
+      for (const transaction of yearTransactions) {
+        const key = transactionDedupeKey(transaction);
+        if (!key) continue;
+        const items = grouped.get(key) || [];
+        items.push(transaction);
+        grouped.set(key, items);
+      }
+
+      const duplicates = Array.from(grouped.values()).filter((items) => items.length > 1);
+      const pendingPostedPairs = duplicates.filter((items) => items.some((item) => item.pending) && items.some((item) => !item.pending)).length;
+      return res.json({
+        ok: true,
+        year,
+        totalDocuments: yearTransactions.length,
+        uniquePlaidTransactionIds: grouped.size,
+        duplicatesFound: duplicates.length,
+        pendingPostedPairs,
+      });
+    } catch (error) {
+      logger.error("TAX DUPLICATE REPORT ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to build duplicate report." });
     }
   });
 
@@ -723,15 +924,19 @@ export function createTaxRouter({
       }
 
       const year = normalizeYear(req.body?.year);
-      const mode = ["unreviewed", "selected", "all"].includes(req.body?.mode) ? req.body.mode : "unreviewed";
+      const mode = ["unreviewed", "review_only", "selected", "all"].includes(req.body?.mode) ? req.body.mode : "unreviewed";
       const reprocess = req.body?.reprocess === true;
+      const autoApplyHighConfidence =
+        config.autoApplyEnabled &&
+        req.body?.autoApplyHighConfidence === true;
       const selectedIds = Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [];
       const selectedKey = [...selectedIds].sort().join("|");
       const existingReviews = await taxStore.listReviews(req.auth.uid);
       const allTransactions = await taxStore.listTransactions(req.auth.uid);
       const yearTransactions = allTransactions.filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      const dedupedYearTransactions = dedupeTransactions(yearTransactions);
       const latestReview = findLatestReviewForYear(existingReviews, year);
-      const currentTaxCenterCounts = buildTaxCenterCounts(yearTransactions, latestReview);
+      const currentTaxCenterCounts = buildTaxCenterCounts(dedupedYearTransactions, latestReview);
       const today = new Date().toISOString().slice(0, 10);
       const todayCount = existingReviews.filter((review) => String(review.createdAt || "").slice(0, 10) === today).length;
       if (todayCount >= config.dailyRunLimit) {
@@ -743,86 +948,251 @@ export function createTaxRouter({
         String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
         ["queued", "running", "preparing", "processing", "completed", "applied"].includes(review.status)
       );
-      if (shouldReuseExistingReview(existing, currentTaxCenterCounts)) {
-        return res.json({ ok: true, review: buildReviewResponse(existing, currentTaxCenterCounts), reused: true });
+      if (existing && isStalledReview(existing)) {
+        await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+          ...existing,
+          status: REVIEW_STATUS.FAILED,
+          currentPhase: "failed",
+          errorMessage: "AI Tax Review stalled. Start a new review.",
+          errorCode: "STALED_REVIEW",
+          heartbeatAt: new Date().toISOString(),
+        }));
       }
-      const reviewId = nextReviewId();
 
       let candidates = yearTransactions;
 
       if (mode === "selected") {
         const selectedSet = new Set(selectedIds);
-        candidates = candidates.filter((transaction) => selectedSet.has(transaction.id) && isNonIncomeExpense(transaction));
+        candidates = candidates.filter((transaction) =>
+          selectedSet.has(transaction.id) &&
+          isNonIncomeExpense(transaction)
+        );
+      } else if (mode === "review_only") {
+        candidates = candidates.filter((transaction) =>
+          isNonIncomeExpense(transaction) &&
+          !transaction.userConfirmed &&
+          transaction.classification === "needs_review" &&
+          transaction.classificationSource !== "ai_suggestion"
+        );
       } else if (mode === "unreviewed") {
-        candidates = candidates.filter((transaction) => reprocess ? isNonIncomeExpense(transaction) : isAiEligibleTransaction(transaction));
+        candidates = candidates.filter((transaction) =>
+          reprocess ? isNonIncomeExpense(transaction) : isAiEligibleTransaction(transaction)
+        );
       } else {
-        candidates = candidates.filter((transaction) => reprocess ? isNonIncomeExpense(transaction) : isAiEligibleTransaction(transaction));
+        // Full-year audit: send every non-income expense to the review engine.
+        // Manual/user-rule decisions are still protected when suggestions are persisted.
+        candidates = candidates.filter((transaction) => isNonIncomeExpense(transaction));
       }
 
-      const rules = await taxStore.listRules(req.auth.uid);
-      await taxStore.upsertReview(req.auth.uid, {
+      candidates = dedupeTransactions(candidates);
+      const sourceAccountCount = new Set(
+        candidates.map((transaction) => String(transaction.accountId || transaction.itemId || "").trim()).filter(Boolean)
+      ).size;
+      const transactionSetHash = hashTransactionSet({
+        year,
+        mode,
+        selectedTransactionIds: selectedIds,
+        transactions: candidates,
+        sourceAccountCount,
+      });
+      const matchingReview = existingReviews.find((review) =>
+        review.year === year &&
+        review.mode === mode &&
+        review.transactionSetHash === transactionSetHash &&
+        String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
+        ["queued", "running", "preparing", "processing"].includes(String(review.status || "").toLowerCase())
+      );
+
+      if (shouldReuseExistingReview(matchingReview, currentTaxCenterCounts)) {
+        logger.info("TAX AI REVIEW DIAGNOSTIC", buildReviewDiagnostics({
+          review: matchingReview,
+          uid: req.auth.uid,
+          reusedExistingReview: true,
+          sourceYear: year,
+          sourceAccountCount,
+          transactionSetHash,
+        }));
+        return res.json({ ok: true, review: buildReviewResponse(matchingReview, currentTaxCenterCounts), reused: true });
+      }
+
+      const reviewId = nextReviewId();
+
+      const totalTransactions = candidates.length;
+      const totalBatches = Math.ceil(totalTransactions / config.batchSize);
+      const initialReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
         id: reviewId,
         year,
         mode,
-        status: "preparing",
+        status: REVIEW_STATUS.PREPARING,
+        currentPhase: "preparing",
+        processedTransactions: 0,
+        totalTransactions,
+        processedBatches: 0,
+        totalBatches,
         selectedTransactionIds: selectedIds,
-        autoApplyHighConfidence: false,
-        progress: {
-          stage: "preparing",
-          stageIndex: 0,
-          totalStages: 3,
-          processed: 0,
-          total: candidates.length,
-        },
-      });
-
-      const review = await runTaxAiReview({
+        autoApplyHighConfidence,
+        transactionSetHash,
+        sourceYear: year,
+        sourceAccountCount,
+        heartbeatAt: new Date().toISOString(),
+      }));
+      const initialTaxCenterCounts = buildTaxCenterCounts(dedupedYearTransactions, initialReview);
+      logger.info("TAX AI REVIEW DIAGNOSTIC", buildReviewDiagnostics({
+        review: initialReview,
         uid: req.auth.uid,
-        store: taxStore,
-        openaiClient,
-        logger,
-        config,
-        reviewId,
-        year,
-        mode,
-        transactions: candidates,
-        rules,
-      });
+        reusedExistingReview: false,
+        sourceYear: year,
+        sourceAccountCount,
+        transactionSetHash,
+      }));
 
-      const persistedSuggestions = [];
-      for (const suggestion of review.suggestions) {
-        const current = await taxStore.getTransaction(req.auth.uid, suggestion.transactionId);
-        if (!current) continue;
-        persistedSuggestions.push(await taxStore.upsertTransaction(req.auth.uid, applyPatchToTransaction(current, {
-          classification: suggestion.classification,
-          deductibility: suggestion.deductibility,
-          taxCategory: suggestion.taxCategory,
-          classificationSource: "ai_suggestion",
-          confidence: suggestion.confidence,
-          aiReason: suggestion.reason,
-          userConfirmed: false,
-          reviewId,
-        })));
-      }
+      void (async () => {
+        try {
+          const rules = await taxStore.listRules(req.auth.uid);
+          const review = await runTaxAiReview({
+            uid: req.auth.uid,
+            store: taxStore,
+            openaiClient,
+            logger,
+            config,
+            reviewId,
+            year,
+            mode,
+            transactions: candidates,
+            rules,
+            transactionSetHash,
+            sourceYear: year,
+            sourceAccountCount,
+            isCancelled: async () => {
+              const current = await taxStore.getReview(req.auth.uid, reviewId);
+              return current?.status === REVIEW_STATUS.CANCELLED;
+            },
+          });
 
-      const responseReview = await taxStore.upsertReview(req.auth.uid, {
-        ...review,
-        suggestions: persistedSuggestions.map((transaction) => ({
-          transactionId: transaction.id,
-          classification: transaction.classification,
-          deductibility: transaction.deductibility,
-          taxCategory: transaction.taxCategory,
-          confidence: transaction.confidence,
-          reason: transaction.aiReason,
-          requiresUserReview: !transaction.userConfirmed,
-          flags: transaction.flags || [],
-        })),
-      });
-      const refreshedTransactions = (await taxStore.listTransactions(req.auth.uid))
-        .filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
-      const refreshedTaxCenterCounts = buildTaxCenterCounts(refreshedTransactions, responseReview);
+          if (review.status === REVIEW_STATUS.CANCELLED) {
+            return;
+          }
 
-      return res.status(201).json({ ok: true, review: buildReviewResponse(responseReview, refreshedTaxCenterCounts) });
+          const progressTotals = {
+            processedTransactions: review.processedTransactions ?? totalTransactions,
+            totalTransactions: review.totalTransactions ?? totalTransactions,
+            processedBatches: review.processedBatches ?? totalBatches,
+            totalBatches: review.totalBatches ?? totalBatches,
+            heartbeatAt: new Date().toISOString(),
+          };
+
+          await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+            ...review,
+            id: reviewId,
+            year,
+            mode,
+            status: REVIEW_STATUS.PROCESSING,
+            currentPhase: "saving",
+            selectedTransactionIds: selectedIds,
+            createdAt: initialReview.createdAt,
+            ...progressTotals,
+          }));
+
+          const persistedSuggestions = [];
+          for (const suggestion of review.suggestions) {
+            const current = await taxStore.getTransaction(req.auth.uid, suggestion.transactionId);
+            if (!current) continue;
+            // Never overwrite a user-confirmed/manual decision. The AI may review it,
+            // but the user's classification remains authoritative until they edit it.
+            if (current.userConfirmed || ["manual", "user_rule"].includes(current.classificationSource)) {
+              continue;
+            }
+            const transaction = await taxStore.upsertTransaction(req.auth.uid, applyPatchToTransaction(current, {
+              classification: suggestion.classification,
+              transactionType: suggestion.transactionType,
+              deductibility: suggestion.deductibility,
+              taxCategory: suggestion.taxCategory,
+              classificationSource: "ai_suggestion",
+              confidence: suggestion.confidence,
+              aiReason: suggestion.reason,
+              userConfirmed: false,
+              reviewId,
+            }));
+            persistedSuggestions.push({ transaction, suggestion });
+          }
+
+          const savedSuggestions = persistedSuggestions.map(({ transaction, suggestion }) => ({
+            transactionId: transaction.id,
+            transactionType: suggestion.transactionType,
+            classification: transaction.classification,
+            deductibility: transaction.deductibility,
+            taxCategory: transaction.taxCategory,
+            businessUsePercentage: suggestion.businessUsePercentage ?? null,
+            confidence: transaction.confidence,
+            reason: transaction.aiReason,
+            requiresUserReview: suggestion.requiresUserReview !== false,
+            flags: suggestion.flags || [],
+            merchantIdentity: suggestion.merchantIdentity || null,
+            webLookupUsed: suggestion.webLookupUsed === true,
+            source: suggestion.source || (suggestion.webLookupUsed ? "aiAndWeb" : "ai"),
+            modelVersion: suggestion.modelVersion || config.model,
+            ruleVersion: suggestion.ruleVersion || "tax-rules-v3",
+            reviewedAt: suggestion.reviewedAt || new Date().toISOString(),
+          }));
+
+          const finalizingReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+            ...review,
+            id: reviewId,
+            year,
+            mode,
+            status: REVIEW_STATUS.PROCESSING,
+            currentPhase: "finalizing",
+            selectedTransactionIds: selectedIds,
+            createdAt: initialReview.createdAt,
+            suggestions: savedSuggestions,
+            ...progressTotals,
+            heartbeatAt: new Date().toISOString(),
+          }));
+
+          await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+            ...finalizingReview,
+            id: reviewId,
+            year,
+            mode,
+            status: REVIEW_STATUS.COMPLETED,
+            currentPhase: "completed",
+            selectedTransactionIds: selectedIds,
+            createdAt: initialReview.createdAt,
+            suggestions: savedSuggestions,
+            ...progressTotals,
+            heartbeatAt: new Date().toISOString(),
+          }));
+        } catch (backgroundError) {
+          logger.error("TAX AI REVIEW BACKGROUND ERROR", errorSummary(backgroundError));
+          const structuredCode = backgroundError?.phase === "validation"
+            ? "INVALID_STRUCTURED_OUTPUT"
+            : backgroundError?.details?.code || backgroundError?.details?.type || backgroundError?.code || "REVIEW_STALLED";
+          const structuredMessage = backgroundError?.details?.message
+            || (backgroundError?.phase === "validation"
+              ? "AI Tax Review validation failed. Start a new review."
+              : backgroundError?.message || "AI Tax Review stalled. Start a new review.");
+          await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+            id: reviewId,
+            year,
+            mode,
+            status: REVIEW_STATUS.FAILED,
+            currentPhase: "failed",
+            processedTransactions: 0,
+            totalTransactions,
+            processedBatches: 0,
+            totalBatches,
+            selectedTransactionIds: selectedIds,
+            transactionSetHash,
+            sourceYear: year,
+            sourceAccountCount,
+            heartbeatAt: new Date().toISOString(),
+            errorMessage: structuredMessage,
+            errorCode: structuredCode,
+          }));
+        }
+      })();
+
+      return res.status(201).json({ ok: true, review: buildReviewResponse(initialReview, initialTaxCenterCounts) });
     } catch (error) {
       logger.error("TAX AI REVIEW ERROR", errorSummary(error));
       return res.status(503).json({ ok: false, error: error?.message || "AI Tax Review is temporarily unavailable. Please try again." });
@@ -834,9 +1204,24 @@ export function createTaxRouter({
     if (!review) {
       return res.status(404).json({ ok: false, error: "AI review not found." });
     }
+    if (isStalledReview(review)) {
+      const stalledReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...review,
+        status: REVIEW_STATUS.FAILED,
+        currentPhase: "failed",
+        errorMessage: "AI Tax Review stalled. Start a new review.",
+        errorCode: "REVIEW_STALLED",
+        heartbeatAt: new Date().toISOString(),
+      }));
+      const yearTransactions = dedupeTransactions((await taxStore.listTransactions(req.auth.uid))
+        .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year));
+      const taxCenterCounts = buildTaxCenterCounts(yearTransactions, stalledReview);
+      return res.json({ ok: true, review: buildReviewResponse(stalledReview, taxCenterCounts) });
+    }
     const yearTransactions = (await taxStore.listTransactions(req.auth.uid))
       .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year);
-    const taxCenterCounts = buildTaxCenterCounts(yearTransactions, review);
+    const dedupedYearTransactions = dedupeTransactions(yearTransactions);
+    const taxCenterCounts = buildTaxCenterCounts(dedupedYearTransactions, review);
     return res.json({ ok: true, review: buildReviewResponse(review, taxCenterCounts) });
   });
 
@@ -859,21 +1244,53 @@ export function createTaxRouter({
       }
 
       const saved = [];
+      const pendingWrites = [];
+      let needsReview = 0;
+      let skippedManual = 0;
+      let invalid = 0;
+      let failed = 0;
       for (const suggestion of preview.suggestions) {
         const current = await taxStore.getTransaction(req.auth.uid, suggestion.transactionId);
-        if (!current) continue;
-        saved.push(await taxStore.upsertTransaction(
-          req.auth.uid,
-          applyPatchToTransaction(current, {
-            classification: suggestion.classification,
-            deductibility: suggestion.deductibility,
-            taxCategory: suggestion.taxCategory,
-            classificationSource: "ai_approved",
-            confidence: suggestion.confidence,
-            aiReason: suggestion.reason,
-            userConfirmed: true,
-          })
-        ));
+        if (!current) {
+          invalid += 1;
+          continue;
+        }
+        if (current.userConfirmed || ["manual", "user_rule"].includes(current.classificationSource)) {
+          skippedManual += 1;
+          continue;
+        }
+        const isSafe = suggestion.requiresUserReview !== true
+          && suggestion.classification !== "needs_review"
+          && suggestion.deductibility !== "needs_review"
+          && Number(suggestion.confidence || 0) >= config.highConfidenceThreshold;
+        if (!isSafe) {
+          needsReview += 1;
+          continue;
+        }
+        pendingWrites.push(applyPatchToTransaction(current, {
+          classification: suggestion.classification,
+          transactionType: suggestion.transactionType,
+          deductibility: suggestion.deductibility,
+          taxCategory: suggestion.taxCategory,
+          classificationSource: "ai_approved",
+          confidence: suggestion.confidence,
+          aiReason: suggestion.reason,
+          userConfirmed: true,
+        }));
+      }
+
+      for (let index = 0; index < pendingWrites.length; index += 400) {
+        const batch = pendingWrites.slice(index, index + 400);
+        try {
+          saved.push(...await taxStore.bulkUpsertTransactions(req.auth.uid, batch));
+        } catch (error) {
+          failed += batch.length;
+          logger.error("TAX AI APPLY BATCH ERROR", {
+            reviewId: String(req.params.reviewId || "").slice(0, 8),
+            batchSize: batch.length,
+            errorCode: error?.code || "BATCH_WRITE_FAILED",
+          });
+        }
       }
 
       await taxStore.upsertReview(req.auth.uid, {
@@ -885,6 +1302,11 @@ export function createTaxRouter({
       return res.json({
         ok: true,
         updated: saved.length,
+        applied: saved.length,
+        needsReview,
+        skippedManual,
+        invalid,
+        failed,
         transactions: saved.map(buildTransactionResponse),
         preview: {
           count: preview.count,
@@ -894,6 +1316,40 @@ export function createTaxRouter({
     } catch (error) {
       logger.error("TAX AI APPLY ERROR", errorSummary(error));
       return res.status(500).json({ ok: false, error: "Failed to apply AI suggestions." });
+    }
+  });
+
+
+  router.post("/ai/reset-active-review", async (req, res) => {
+    try {
+      const year = normalizeYear(req.body?.year);
+      const reviews = await taxStore.listReviews(req.auth.uid);
+      const active = reviews
+        .filter((review) => review.year === year && isActiveReviewStatus(review.status))
+        .sort((left, right) => reviewSortValue(right).localeCompare(reviewSortValue(left)))[0] || null;
+
+      if (!active) {
+        return res.json({ ok: true, reset: false });
+      }
+
+      const resetReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...active,
+        id: active.id,
+        status: REVIEW_STATUS.CANCELLED,
+        currentPhase: "cancelled",
+        processedTransactions: active.processedTransactions || 0,
+        totalTransactions: active.totalTransactions || 0,
+        processedBatches: active.processedBatches || 0,
+        totalBatches: active.totalBatches || 0,
+        heartbeatAt: new Date().toISOString(),
+        errorMessage: "AI Tax Review was reset by the user.",
+        errorCode: "MANUAL_RESET",
+      }));
+
+      return res.json({ ok: true, reset: true, review: buildReviewResponse(resetReview) });
+    } catch (error) {
+      logger.error("TAX AI RESET ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to reset AI Tax Review." });
     }
   });
 
