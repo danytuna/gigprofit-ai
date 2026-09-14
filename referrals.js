@@ -2,6 +2,7 @@ import express from "express";
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
+import nodemailer from "nodemailer";
 
 const APP_STORE_URL =
   process.env.GIGPROFIT_APP_STORE_URL ||
@@ -21,6 +22,29 @@ const MAX_RECENT_FINGERPRINTS = 1500;
 const UNIQUE_WINDOW_DAYS = 14;
 const DEFAULT_DOWNLOAD_BONUS = 1;
 const MIN_PAYOUT = Math.max(0, Number(process.env.REFERRAL_MIN_PAYOUT || 0));
+
+const CREATOR_PORTAL_URL =
+  process.env.CREATOR_PORTAL_URL ||
+  `${REFERRAL_BASE_URL}/creator`;
+
+const CREATOR_EMAIL_SMTP_HOST =
+  process.env.CREATOR_EMAIL_SMTP_HOST ||
+  "smtp.gmail.com";
+
+const CREATOR_EMAIL_SMTP_PORT =
+  Math.max(1, Number(process.env.CREATOR_EMAIL_SMTP_PORT || 465));
+
+const CREATOR_EMAIL_SMTP_SECURE =
+  String(
+    process.env.CREATOR_EMAIL_SMTP_SECURE ??
+    (CREATOR_EMAIL_SMTP_PORT === 465 ? "true" : "false")
+  ).toLowerCase() === "true";
+
+const CREATOR_EMAIL_FROM =
+  process.env.CREATOR_EMAIL_FROM ||
+  `GigProfit Creator Program <${process.env.CREATOR_EMAIL_SMTP_USER || CONTACT_EMAIL}>`;
+
+let creatorMailer = null;
 
 let loaded = false;
 let store = {
@@ -81,6 +105,150 @@ function safeEqualText(a, b) {
   return aa.length > 0 && aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function creatorEmailConfigured() {
+  return Boolean(
+    String(process.env.CREATOR_EMAIL_SMTP_USER || "").trim() &&
+    String(process.env.CREATOR_EMAIL_SMTP_PASS || "").trim()
+  );
+}
+
+function getCreatorMailer() {
+  if (!creatorEmailConfigured()) return null;
+  if (creatorMailer) return creatorMailer;
+
+  creatorMailer = nodemailer.createTransport({
+    host: CREATOR_EMAIL_SMTP_HOST,
+    port: CREATOR_EMAIL_SMTP_PORT,
+    secure: CREATOR_EMAIL_SMTP_SECURE,
+    auth: {
+      user: process.env.CREATOR_EMAIL_SMTP_USER,
+      pass: process.env.CREATOR_EMAIL_SMTP_PASS,
+    },
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
+  });
+
+  return creatorMailer;
+}
+
+function creatorInvitationMessage(creator, accessKey) {
+  const referralUrl =
+    `${REFERRAL_BASE_URL}/r/${encodeURIComponent(creator.code)}`;
+
+  const subject = "Welcome to the GigProfit Creator Program";
+
+  const text = [
+    `Hi ${creator.name},`,
+    "",
+    "You've been added to the GigProfit Creator Program by Nova Prime LLC.",
+    "",
+    "Your creator login:",
+    `Creator Portal: ${CREATOR_PORTAL_URL}`,
+    `Referral code: ${creator.code}`,
+    `Email: ${creator.email}`,
+    `Creator access key: ${accessKey}`,
+    "",
+    "Your referral link:",
+    referralUrl,
+    "",
+    "Compensation:",
+    `Reel fee: ${moneyNumber(creator.reelFee).toFixed(2)}`,
+    `Verified download bonus: ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download`,
+    "",
+    "Use only the referral code in the Referral code field — do not paste the full referral URL.",
+    "Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.",
+    "",
+    `Creator support: ${CONTACT_EMAIL}`,
+    "",
+    "GigProfit · Nova Prime LLC",
+  ].join("\n");
+
+  const html = `
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:#07080c;color:#f7f8fb;padding:32px">
+      <div style="max-width:620px;margin:0 auto;background:#11151f;border:1px solid #252b38;border-radius:18px;padding:28px">
+        <div style="font-size:14px;color:#ff7a1a;font-weight:700;letter-spacing:.04em">GIGPROFIT CREATOR PROGRAM</div>
+        <h1 style="font-size:28px;margin:10px 0 8px">Welcome, ${htmlEscape(creator.name)}</h1>
+        <p style="color:#b8c0cf">You've been added to the GigProfit Creator Program by Nova Prime LLC.</p>
+
+        <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
+          <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Creator login</div>
+          <p><strong>Portal:</strong> <a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">${htmlEscape(CREATOR_PORTAL_URL)}</a></p>
+          <p><strong>Referral code:</strong> ${htmlEscape(creator.code)}</p>
+          <p><strong>Email:</strong> ${htmlEscape(creator.email)}</p>
+          <p><strong>Access key:</strong><br><code style="display:inline-block;margin-top:6px;padding:9px 12px;background:#171c27;border-radius:8px;color:#fff">${htmlEscape(accessKey)}</code></p>
+        </div>
+
+        <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
+          <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Your referral link</div>
+          <p><a style="color:#69a3ff" href="${htmlEscape(referralUrl)}">${htmlEscape(referralUrl)}</a></p>
+        </div>
+
+        <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
+          <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Compensation</div>
+          <p><strong>Reel fee:</strong> ${moneyNumber(creator.reelFee).toFixed(2)}</p>
+          <p><strong>Verified download bonus:</strong> ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download</p>
+        </div>
+
+        <p style="color:#b8c0cf"><strong>Important:</strong> In the Referral code field, enter only <strong>${htmlEscape(creator.code)}</strong>, not the full referral URL.</p>
+        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.</p>
+        <p style="color:#8f9aab;margin-top:28px">Creator support: <a style="color:#69a3ff" href="mailto:${htmlEscape(CONTACT_EMAIL)}">${htmlEscape(CONTACT_EMAIL)}</a></p>
+        <div style="color:#687284;font-size:12px;margin-top:26px">GigProfit · Nova Prime LLC</div>
+      </div>
+    </div>
+  `;
+
+  return { subject, text, html, referralUrl };
+}
+
+async function sendCreatorInvitation(creator, accessKey) {
+  const mailer = getCreatorMailer();
+
+  if (!mailer) {
+    return {
+      configured: false,
+      sent: false,
+      error: "Creator email delivery is not configured",
+    };
+  }
+
+  const message = creatorInvitationMessage(creator, accessKey);
+
+  try {
+    const info = await mailer.sendMail({
+      from: CREATOR_EMAIL_FROM,
+      to: creator.email,
+      replyTo: CONTACT_EMAIL,
+      subject: message.subject,
+      text: message.text,
+      html: message.html,
+    });
+
+    return {
+      configured: true,
+      sent: true,
+      messageId: info?.messageId || null,
+      sentAt: nowISO(),
+    };
+  } catch (error) {
+    console.error("CREATOR INVITATION EMAIL ERROR:", error);
+    return {
+      configured: true,
+      sent: false,
+      error: error?.message || String(error),
+    };
+  }
+}
+
 function moneyNumber(value) {
   const number = Number(value || 0);
   return Number.isFinite(number) ? Number(number.toFixed(2)) : 0;
@@ -113,6 +281,11 @@ function ensureCreatorShape(creator) {
   creator.cashApp.providerCustomerId = creator.cashApp.providerCustomerId || null;
   creator.cashApp.providerGrantId = creator.cashApp.providerGrantId || null;
   creator.cashApp.updatedAt = creator.cashApp.updatedAt || null;
+  creator.invitation ||= {};
+  creator.invitation.lastSentAt = creator.invitation.lastSentAt || null;
+  creator.invitation.lastMessageId = creator.invitation.lastMessageId || null;
+  creator.invitation.lastError = creator.invitation.lastError || null;
+  creator.invitation.delivery = creator.invitation.delivery || "not_sent";
   return creator;
 }
 
@@ -287,6 +460,11 @@ function creatorView(creator, includePrivate = false) {
   if (includePrivate) {
     view.email = creator.email;
     view.notes = creator.notes || "";
+    view.invitation = {
+      delivery: creator.invitation?.delivery || "not_sent",
+      lastSentAt: creator.invitation?.lastSentAt || null,
+      lastError: creator.invitation?.lastError || null,
+    };
     view.cashApp.providerCustomerId = creator.cashApp?.providerCustomerId || null;
     view.cashApp.providerGrantId = creator.cashApp?.providerGrantId || null;
   }
@@ -427,6 +605,7 @@ export function createReferralRouter() {
       creators: Object.keys(store.creators).length,
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      creatorEmailConfigured: creatorEmailConfigured(),
       storage: DATA_PATH,
       contact: CONTACT_EMAIL,
     });
@@ -656,6 +835,7 @@ export function createReferralRouter() {
       ok: true,
       creators,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      creatorEmailConfigured: creatorEmailConfigured(),
       contactEmail: CONTACT_EMAIL,
     });
   });
@@ -723,6 +903,12 @@ export function createReferralRouter() {
         revenue: 0,
         paidEarnings: 0,
       },
+      invitation: {
+        delivery: "not_sent",
+        lastSentAt: null,
+        lastMessageId: null,
+        lastError: null,
+      },
       recentFingerprints: [],
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -731,10 +917,26 @@ export function createReferralRouter() {
     store.creators[code] = creator;
     await persist();
 
+    const invitationEmail = await sendCreatorInvitation(creator, accessKey);
+
+    if (invitationEmail.sent) {
+      creator.invitation.delivery = "sent";
+      creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
+      creator.invitation.lastMessageId = invitationEmail.messageId || null;
+      creator.invitation.lastError = null;
+    } else {
+      creator.invitation.delivery = invitationEmail.configured ? "failed" : "not_configured";
+      creator.invitation.lastError = invitationEmail.error || null;
+    }
+
+    creator.updatedAt = nowISO();
+    await persist();
+
     return res.status(201).json({
       ok: true,
       creator: creatorView(creator, true),
       accessKey,
+      invitationEmail,
     });
   });
 
@@ -830,6 +1032,65 @@ export function createReferralRouter() {
 
       return res.json({
         ok: true,
+        creator: creatorView(creator, true),
+      });
+    }
+  );
+
+  router.post(
+    "/admin/creators/:code/send-login-email",
+    requireAdmin,
+    async (req, res) => {
+      await ensureLoaded();
+
+      const code = slugify(req.params.code);
+      const creator = store.creators[code];
+
+      if (!creator) {
+        return res.status(404).json({ error: "Creator not found" });
+      }
+
+      if (!creatorEmailConfigured()) {
+        return res.status(503).json({
+          error: "Creator email delivery is not configured",
+          requiredEnv: [
+            "CREATOR_EMAIL_SMTP_USER",
+            "CREATOR_EMAIL_SMTP_PASS"
+          ],
+        });
+      }
+
+      const accessKey = crypto.randomBytes(12).toString("base64url");
+      const invitationEmail = await sendCreatorInvitation(creator, accessKey);
+
+      if (!invitationEmail.sent) {
+        creator.invitation ||= {};
+        creator.invitation.delivery = "failed";
+        creator.invitation.lastError = invitationEmail.error || "Email delivery failed";
+        creator.updatedAt = nowISO();
+        await persist();
+
+        return res.status(502).json({
+          error: "Unable to send creator login email",
+          details: invitationEmail.error || null,
+        });
+      }
+
+      creator.accessKeyHash = hashSecret(accessKey);
+      creator.invitation ||= {};
+      creator.invitation.delivery = "sent";
+      creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
+      creator.invitation.lastMessageId = invitationEmail.messageId || null;
+      creator.invitation.lastError = null;
+      creator.updatedAt = nowISO();
+      await persist();
+
+      return res.json({
+        ok: true,
+        invitationEmail: {
+          sent: true,
+          sentAt: creator.invitation.lastSentAt,
+        },
         creator: creatorView(creator, true),
       });
     }
