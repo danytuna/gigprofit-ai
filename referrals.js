@@ -90,6 +90,48 @@ function normalizeCashtag(value) {
   return `$${clean}`;
 }
 
+function normalizeReelUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (!["http:", "https:"].includes(url.protocol)) return null;
+
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      const lower = key.toLowerCase();
+      if (
+        lower.startsWith("utm_") ||
+        ["fbclid", "gclid", "igshid", "igsh", "tt_from", "share_app_id"].includes(lower)
+      ) {
+        url.searchParams.delete(key);
+      }
+    }
+
+    url.hostname = url.hostname.toLowerCase();
+    if (url.pathname.length > 1) {
+      url.pathname = url.pathname.replace(/\/+$/, "");
+    }
+
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function reelPlatformFor(urlValue) {
+  try {
+    const host = new URL(urlValue).hostname.toLowerCase().replace(/^www\./, "");
+    if (host.includes("instagram.com")) return "Instagram";
+    if (host.includes("tiktok.com")) return "TikTok";
+    if (host.includes("youtube.com") || host === "youtu.be") return "YouTube";
+    if (host.includes("facebook.com") || host === "fb.watch") return "Facebook";
+    if (host.includes("threads.net")) return "Threads";
+    if (host.includes("x.com") || host.includes("twitter.com")) return "X";
+    return host;
+  } catch {
+    return "Video";
+  }
+}
+
 function hashSecret(value) {
   return crypto
     .createHash("sha256")
@@ -317,6 +359,87 @@ async function sendProgramEmail({ to, subject, title, textLines = [], htmlLines 
   }
 }
 
+async function sendOwnerReelReviewNotification(creator) {
+  const reel = creator.reelSubmission;
+  if (!reel) return { sent: false, error: "Reel submission missing" };
+
+  return sendProgramEmail({
+    to: CONTACT_EMAIL,
+    subject: `GigProfit Reel Review — ${creator.name}`,
+    title: "New Reel Submitted",
+    textLines: [
+      `Creator: ${creator.name}`,
+      `Platform: ${reel.platform || "Video"}`,
+      `Reel fee if approved: $${moneyNumber(creator.reelFee).toFixed(2)}`,
+      `Video: ${reel.url}`,
+      "",
+      `Review it here: ${OWNER_PORTAL_URL}`,
+    ],
+    htmlLines: [
+      `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+        <p><strong>Creator:</strong> ${htmlEscape(creator.name)}</p>
+        <p><strong>Platform:</strong> ${htmlEscape(reel.platform || "Video")}</p>
+        <p><strong>Reel fee if approved:</strong> $${moneyNumber(creator.reelFee).toFixed(2)}</p>
+      </div>`,
+      `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(reel.url)}">Open submitted video</a></p>`,
+      `<p><a style="color:#69a3ff" href="${htmlEscape(OWNER_PORTAL_URL)}">Open Owner Center to approve or reject</a></p>`,
+    ],
+  });
+}
+
+async function sendCreatorReelStatusNotification(creator, type) {
+  const reel = creator.reelSubmission;
+  if (!creator?.email || !reel) {
+    return { sent: false, error: "Creator email or Reel submission missing" };
+  }
+
+  if (type === "approved") {
+    const fee = moneyNumber(reel.approvedFee ?? creator.reelFee);
+    return sendProgramEmail({
+      to: creator.email,
+      subject: `Your GigProfit Reel was approved — $${fee.toFixed(2)} added`,
+      title: "Reel Approved",
+      textLines: [
+        `Hi ${creator.name},`,
+        "Your GigProfit promotional Reel has been approved.",
+        `Reel fee credited: $${fee.toFixed(2)}`,
+        `Video: ${reel.url}`,
+        "",
+        "The Reel fee is now included in your available GigProfit earnings, subject to any pending Cash Out requests.",
+      ],
+      htmlLines: [
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your GigProfit promotional Reel has been <strong>approved</strong>.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reel fee credited:</strong> $${fee.toFixed(2)}</div>`,
+        `<p><a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>`,
+      ],
+    });
+  }
+
+  if (type === "rejected") {
+    return sendProgramEmail({
+      to: creator.email,
+      subject: "Update on your GigProfit Reel submission",
+      title: "Reel Needs Changes",
+      textLines: [
+        `Hi ${creator.name},`,
+        "Your submitted Reel was not approved.",
+        `Reason: ${reel.rejectionReason || "Please contact Creator Support for details."}`,
+        "",
+        "No Reel fee was credited. You can submit a new or corrected video from your Creator Center.",
+      ],
+      htmlLines: [
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your submitted Reel was <strong>not approved</strong>.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> ${htmlEscape(reel.rejectionReason || "Please contact Creator Support for details.")}</div>`,
+        `<p style="color:#b8c0cf">No Reel fee was credited. You can submit a corrected video from your Creator Center.</p>`,
+      ],
+    });
+  }
+
+  return { sent: false, error: "Unknown Reel notification type" };
+}
+
 async function sendOwnerPayoutRequestNotification(creator, payout) {
   return sendProgramEmail({
     to: CONTACT_EMAIL,
@@ -458,6 +581,30 @@ function ensureCreatorShape(creator) {
     DEFAULT_DOWNLOAD_BONUS
   );
   creator.reelCompleted = Boolean(creator.reelCompleted);
+  if (creator.reelSubmission && typeof creator.reelSubmission === "object") {
+    creator.reelSubmission.status =
+      creator.reelSubmission.status ||
+      (creator.reelCompleted ? "approved" : "pending");
+    creator.reelSubmission.url = creator.reelSubmission.url || null;
+    creator.reelSubmission.normalizedUrl =
+      creator.reelSubmission.normalizedUrl ||
+      normalizeReelUrl(creator.reelSubmission.url) ||
+      creator.reelSubmission.url ||
+      null;
+    creator.reelSubmission.platform =
+      creator.reelSubmission.platform ||
+      reelPlatformFor(creator.reelSubmission.url);
+    creator.reelSubmission.approvedFee =
+      creator.reelSubmission.approvedFee === null ||
+      creator.reelSubmission.approvedFee === undefined
+        ? null
+        : moneyNumber(creator.reelSubmission.approvedFee);
+    creator.reelSubmission.rejectionReason =
+      creator.reelSubmission.rejectionReason || null;
+    creator.reelSubmission.notifications ||= {};
+  } else {
+    creator.reelSubmission = null;
+  }
   creator.metrics.clicks = Number(creator.metrics.clicks || 0);
   creator.metrics.uniqueClicks = Number(creator.metrics.uniqueClicks || 0);
   creator.metrics.installs = Number(creator.metrics.installs || 0);
@@ -577,7 +724,9 @@ function reservedAmountForCreator(code) {
 function earningsForCreator(creator) {
   ensureCreatorShape(creator);
 
-  const reelEarnings = creator.reelCompleted ? creator.reelFee : 0;
+  const reelEarnings = creator.reelCompleted
+    ? moneyNumber(creator.reelSubmission?.approvedFee ?? creator.reelFee)
+    : 0;
   const downloadEarnings =
     Number(creator.metrics.installs || 0) * Number(creator.downloadBonus || 0);
   const grossEarnings = moneyNumber(reelEarnings + downloadEarnings);
@@ -594,6 +743,40 @@ function earningsForCreator(creator) {
     paidEarnings,
     pendingPayouts,
     availableEarnings,
+  };
+}
+
+function reelSubmissionView(creator) {
+  const reel = creator.reelSubmission;
+
+  if (!reel) {
+    return {
+      status: creator.reelCompleted ? "approved" : "not_submitted",
+      url: null,
+      platform: null,
+      submittedAt: null,
+      reviewedAt: null,
+      approvedAt: null,
+      rejectedAt: null,
+      rejectionReason: null,
+      approvedFee: creator.reelCompleted ? moneyNumber(creator.reelFee) : null,
+    };
+  }
+
+  return {
+    id: reel.id || null,
+    status: reel.status || "pending",
+    url: reel.url || null,
+    platform: reel.platform || reelPlatformFor(reel.url),
+    submittedAt: reel.submittedAt || null,
+    reviewedAt: reel.reviewedAt || null,
+    approvedAt: reel.approvedAt || null,
+    rejectedAt: reel.rejectedAt || null,
+    rejectionReason: reel.rejectionReason || null,
+    approvedFee:
+      reel.approvedFee === null || reel.approvedFee === undefined
+        ? null
+        : moneyNumber(reel.approvedFee),
   };
 }
 
@@ -629,6 +812,7 @@ function creatorView(creator, includePrivate = false) {
     campaignUrl: creator.campaignUrl || null,
     reelFee: moneyNumber(creator.reelFee),
     reelCompleted: Boolean(creator.reelCompleted),
+    reelSubmission: reelSubmissionView(creator),
     downloadBonus: moneyNumber(creator.downloadBonus),
     minimumPayout: MIN_PAYOUT,
     cashApp: {
@@ -890,6 +1074,93 @@ export function createReferralRouter() {
     });
   });
 
+  router.post("/creator/:code/reel", async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+
+    if (!creator || creator.status !== "active") {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    if (!creatorAuthorized(req, creator)) {
+      return res.status(401).json({ error: "Invalid creator key" });
+    }
+
+    ensureCreatorShape(creator);
+
+    if (creator.reelCompleted || creator.reelSubmission?.status === "approved") {
+      return res.status(409).json({
+        error: "Your Reel has already been approved and credited",
+      });
+    }
+
+    if (creator.reelSubmission?.status === "pending") {
+      return res.status(409).json({
+        error: "A Reel is already pending review",
+      });
+    }
+
+    const normalizedUrl = normalizeReelUrl(req.body?.url);
+    if (!normalizedUrl) {
+      return res.status(400).json({
+        error: "Enter a valid public video URL",
+      });
+    }
+
+    for (const other of Object.values(store.creators)) {
+      ensureCreatorShape(other);
+      if (
+        other.code !== code &&
+        other.reelSubmission?.normalizedUrl === normalizedUrl &&
+        ["pending", "approved"].includes(other.reelSubmission?.status)
+      ) {
+        return res.status(409).json({
+          error: "This video link has already been submitted to GigProfit",
+        });
+      }
+    }
+
+    const timestamp = nowISO();
+    creator.reelCompleted = false;
+    creator.reelSubmission = {
+      id: `reel_${crypto.randomUUID()}`,
+      url: normalizedUrl,
+      normalizedUrl,
+      platform: reelPlatformFor(normalizedUrl),
+      status: "pending",
+      submittedAt: timestamp,
+      reviewedAt: null,
+      approvedAt: null,
+      rejectedAt: null,
+      rejectionReason: null,
+      approvedFee: null,
+      reviewedBy: null,
+      notifications: {},
+    };
+    creator.updatedAt = timestamp;
+    await persist();
+
+    const ownerNotification = await sendOwnerReelReviewNotification(creator);
+    if (ownerNotification.sent) {
+      creator.reelSubmission.notifications.ownerSubmittedAt =
+        ownerNotification.sentAt || nowISO();
+      creator.reelSubmission.notifications.ownerSubmittedMessageId =
+        ownerNotification.messageId || null;
+    } else {
+      creator.reelSubmission.notifications.ownerSubmittedError =
+        ownerNotification.error || null;
+    }
+    await persist();
+
+    return res.status(201).json({
+      ok: true,
+      reelSubmission: reelSubmissionView(creator),
+      creator: creatorView(creator, false),
+    });
+  });
+
   router.put("/creator/:code/cashapp", async (req, res) => {
     await ensureLoaded();
 
@@ -1092,7 +1363,8 @@ export function createReferralRouter() {
       status: "active",
       campaignUrl: String(req.body?.campaignUrl || "").trim() || null,
       reelFee: Math.max(0, moneyNumber(req.body?.reelFee)),
-      reelCompleted: Boolean(req.body?.reelCompleted),
+      reelCompleted: false,
+      reelSubmission: null,
       downloadBonus: Math.max(
         0,
         moneyNumber(req.body?.downloadBonus ?? DEFAULT_DOWNLOAD_BONUS)
@@ -1197,7 +1469,9 @@ export function createReferralRouter() {
     }
 
     if (req.body?.reelCompleted !== undefined) {
-      creator.reelCompleted = Boolean(req.body.reelCompleted);
+      return res.status(409).json({
+        error: "Reel completion is controlled by the Reel review workflow",
+      });
     }
 
     if (req.body?.notes !== undefined) {
@@ -1212,6 +1486,118 @@ export function createReferralRouter() {
       creator: creatorView(creator, true),
     });
   });
+
+  router.post(
+    "/admin/creators/:code/reel/approve",
+    requireAdmin,
+    async (req, res) => {
+      await ensureLoaded();
+
+      const code = slugify(req.params.code);
+      const creator = store.creators[code];
+
+      if (!creator) {
+        return res.status(404).json({ error: "Creator not found" });
+      }
+
+      ensureCreatorShape(creator);
+      const reel = creator.reelSubmission;
+
+      if (!reel || reel.status !== "pending") {
+        return res.status(409).json({
+          error: reel?.status === "approved"
+            ? "This Reel has already been approved and credited"
+            : "There is no pending Reel to approve",
+        });
+      }
+
+      const timestamp = nowISO();
+      reel.status = "approved";
+      reel.approvedFee = moneyNumber(creator.reelFee);
+      reel.reviewedAt = timestamp;
+      reel.approvedAt = timestamp;
+      reel.rejectedAt = null;
+      reel.rejectionReason = null;
+      reel.reviewedBy = "Nova Prime owner";
+      creator.reelCompleted = true;
+      creator.updatedAt = timestamp;
+      await persist();
+
+      const notification = await sendCreatorReelStatusNotification(creator, "approved");
+      reel.notifications ||= {};
+      if (notification.sent) {
+        reel.notifications.creatorApprovedAt = notification.sentAt || nowISO();
+        reel.notifications.creatorApprovedMessageId = notification.messageId || null;
+      } else {
+        reel.notifications.creatorApprovedError = notification.error || null;
+      }
+      await persist();
+
+      return res.json({
+        ok: true,
+        credited: reel.approvedFee,
+        creator: creatorView(creator, true),
+      });
+    }
+  );
+
+  router.post(
+    "/admin/creators/:code/reel/reject",
+    requireAdmin,
+    async (req, res) => {
+      await ensureLoaded();
+
+      const code = slugify(req.params.code);
+      const creator = store.creators[code];
+
+      if (!creator) {
+        return res.status(404).json({ error: "Creator not found" });
+      }
+
+      ensureCreatorShape(creator);
+      const reel = creator.reelSubmission;
+
+      if (!reel || reel.status !== "pending") {
+        return res.status(409).json({
+          error: reel?.status === "approved"
+            ? "An approved Reel cannot be rejected after it has been credited"
+            : "There is no pending Reel to reject",
+        });
+      }
+
+      const reason = String(
+        req.body?.reason ||
+        "The submitted video did not meet GigProfit promotional requirements."
+      ).trim();
+
+      const timestamp = nowISO();
+      reel.status = "rejected";
+      reel.reviewedAt = timestamp;
+      reel.rejectedAt = timestamp;
+      reel.approvedAt = null;
+      reel.approvedFee = null;
+      reel.rejectionReason = reason;
+      reel.reviewedBy = "Nova Prime owner";
+      creator.reelCompleted = false;
+      creator.updatedAt = timestamp;
+      await persist();
+
+      const notification = await sendCreatorReelStatusNotification(creator, "rejected");
+      reel.notifications ||= {};
+      if (notification.sent) {
+        reel.notifications.creatorRejectedAt = notification.sentAt || nowISO();
+        reel.notifications.creatorRejectedMessageId = notification.messageId || null;
+      } else {
+        reel.notifications.creatorRejectedError = notification.error || null;
+      }
+      await persist();
+
+      return res.json({
+        ok: true,
+        creator: creatorView(creator, true),
+      });
+    }
+  );
 
   router.post(
     "/admin/creators/:code/metrics",
