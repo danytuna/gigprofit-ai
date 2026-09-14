@@ -116,17 +116,12 @@ function getClientIP(req) {
   return forwarded || req.ip || req.socket?.remoteAddress || "unknown";
 }
 
-function dayKey(date = new Date()) {
-  return date.toISOString().slice(0, 10);
-}
-
 function fingerprintFor(req, creatorCode) {
   const raw = [
     process.env.REFERRAL_HASH_SALT || "gigprofit-referrals-v1",
     creatorCode,
     getClientIP(req),
     String(req.headers["user-agent"] || ""),
-    dayKey(),
   ].join("|");
 
   return hashSecret(raw);
