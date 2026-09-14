@@ -14,6 +14,14 @@ const REFERRAL_BASE_URL =
 
 const CONTACT_EMAIL = "danny.novaprime@gmail.com";
 
+const OWNER_PORTAL_URL =
+  process.env.OWNER_PORTAL_URL ||
+  `${REFERRAL_BASE_URL}/owner`;
+
+const OWNER_CASHAPP_CASHTAG =
+  normalizeCashtag(process.env.OWNER_CASHAPP_CASHTAG || "$novaprimellc") ||
+  "$novaprimellc";
+
 const DATA_PATH =
   process.env.REFERRAL_DATA_PATH ||
   path.join(process.cwd(), "data", "gigprofit-referrals.json");
@@ -247,6 +255,191 @@ async function sendCreatorInvitation(creator, accessKey) {
       error: error?.message || String(error),
     };
   }
+}
+
+
+async function sendProgramEmail({ to, subject, title, textLines = [], htmlLines = [] }) {
+  const mailer = getCreatorMailer();
+
+  if (!mailer) {
+    return {
+      configured: false,
+      sent: false,
+      error: "Creator email delivery is not configured",
+    };
+  }
+
+  const text = [
+    title,
+    "",
+    ...textLines,
+    "",
+    `Support: ${CONTACT_EMAIL}`,
+    "",
+    "GigProfit · Nova Prime LLC",
+  ].join("\n");
+
+  const html = `
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:#07080c;color:#f7f8fb;padding:32px">
+      <div style="max-width:620px;margin:0 auto;background:#11151f;border:1px solid #252b38;border-radius:18px;padding:28px">
+        <div style="font-size:14px;color:#ff7a1a;font-weight:700;letter-spacing:.04em">GIGPROFIT CREATOR PROGRAM</div>
+        <h1 style="font-size:26px;margin:10px 0 18px">${htmlEscape(title)}</h1>
+        ${htmlLines.join("\n")}
+        <p style="color:#8f9aab;margin-top:28px">Support: <a style="color:#69a3ff" href="mailto:${htmlEscape(CONTACT_EMAIL)}">${htmlEscape(CONTACT_EMAIL)}</a></p>
+        <div style="color:#687284;font-size:12px;margin-top:26px">GigProfit · Nova Prime LLC</div>
+      </div>
+    </div>
+  `;
+
+  try {
+    const info = await mailer.sendMail({
+      from: CREATOR_EMAIL_FROM,
+      to,
+      replyTo: CONTACT_EMAIL,
+      subject,
+      text,
+      html,
+    });
+
+    return {
+      configured: true,
+      sent: true,
+      messageId: info?.messageId || null,
+      sentAt: nowISO(),
+    };
+  } catch (error) {
+    console.error("CREATOR PROGRAM EMAIL ERROR:", error);
+    return {
+      configured: true,
+      sent: false,
+      error: error?.message || String(error),
+    };
+  }
+}
+
+async function sendOwnerPayoutRequestNotification(creator, payout) {
+  return sendProgramEmail({
+    to: CONTACT_EMAIL,
+    subject: `New GigProfit Cash Out Request — $${moneyNumber(payout.amount).toFixed(2)} — ${creator.name}`,
+    title: "New Cash Out Request",
+    textLines: [
+      `Creator: ${creator.name}`,
+      `Amount: $${moneyNumber(payout.amount).toFixed(2)}`,
+      `Cash App destination: ${payout.cashtag}`,
+      `Payout ID: ${payout.id}`,
+      "",
+      `Review and approve or reject it here: ${OWNER_PORTAL_URL}`,
+      `Your payout source: ${OWNER_CASHAPP_CASHTAG}`,
+    ],
+    htmlLines: [
+      `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+        <p><strong>Creator:</strong> ${htmlEscape(creator.name)}</p>
+        <p><strong>Amount:</strong> $${moneyNumber(payout.amount).toFixed(2)}</p>
+        <p><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</p>
+        <p><strong>Payout ID:</strong> ${htmlEscape(payout.id)}</p>
+      </div>`,
+      `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(OWNER_PORTAL_URL)}">Review Cash Out</a></p>`,
+      `<p style="color:#8f9aab">Payout source configured for Nova Prime: <strong>${htmlEscape(OWNER_CASHAPP_CASHTAG)}</strong></p>`,
+    ],
+  });
+}
+
+async function sendCreatorPayoutStatusNotification(creator, payout, type) {
+  if (!creator?.email) {
+    return { configured: creatorEmailConfigured(), sent: false, error: "Creator email missing" };
+  }
+
+  const amount = moneyNumber(payout.amount).toFixed(2);
+
+  if (type === "approved") {
+    return sendProgramEmail({
+      to: creator.email,
+      subject: `Your GigProfit payout of $${amount} was approved`,
+      title: "Cash Out Approved",
+      textLines: [
+        `Hi ${creator.name},`,
+        `Your Cash Out request for $${amount} has been approved.`,
+        `Cash App destination: ${payout.cashtag}`,
+        "",
+        "Your payout is being processed. You will receive another confirmation when it is marked paid.",
+      ],
+      htmlLines: [
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your Cash Out request for <strong>$${amount}</strong> has been approved.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</div>`,
+        `<p style="color:#b8c0cf">You will receive another confirmation when the payout is marked paid.</p>`,
+      ],
+    });
+  }
+
+  if (type === "paid") {
+    return sendProgramEmail({
+      to: creator.email,
+      subject: `Your GigProfit payout of $${amount} has been sent`,
+      title: "Payout Sent",
+      textLines: [
+        `Hi ${creator.name},`,
+        `Your GigProfit payout of $${amount} has been marked paid.`,
+        `Cash App destination: ${payout.cashtag}`,
+        "",
+        "You can view the payout in your Creator Center history.",
+      ],
+      htmlLines: [
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your GigProfit payout of <strong>$${amount}</strong> has been sent.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</div>`,
+        `<p><a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>`,
+      ],
+    });
+  }
+
+  if (type === "rejected") {
+    return sendProgramEmail({
+      to: creator.email,
+      subject: `Update on your GigProfit Cash Out request`,
+      title: "Cash Out Request Update",
+      textLines: [
+        `Hi ${creator.name},`,
+        `Your Cash Out request for $${amount} was not approved.`,
+        `Reason: ${payout.failureReason || "Contact Creator Support for details."}`,
+        "",
+        "The reserved amount has been returned to your available balance.",
+      ],
+      htmlLines: [
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your Cash Out request for <strong>$${amount}</strong> was not approved.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> ${htmlEscape(payout.failureReason || "Contact Creator Support for details.")}</div>`,
+        `<p style="color:#b8c0cf">The reserved amount has been returned to your available balance.</p>`,
+      ],
+    });
+  }
+
+  return { configured: creatorEmailConfigured(), sent: false, error: "Unknown payout notification type" };
+}
+
+async function notifyPayoutOnce(payout, type) {
+  payout.notifications ||= {};
+
+  const key = `${type}At`;
+  if (payout.notifications[key]) {
+    return { sent: false, skipped: true };
+  }
+
+  const creator = store.creators[payout.creatorCode];
+  if (!creator) {
+    return { sent: false, error: "Creator not found" };
+  }
+
+  const result = await sendCreatorPayoutStatusNotification(creator, payout, type);
+
+  if (result.sent) {
+    payout.notifications[key] = result.sentAt || nowISO();
+    payout.notifications[`${type}MessageId`] = result.messageId || null;
+  } else {
+    payout.notifications[`${type}Error`] = result.error || null;
+  }
+
+  return result;
 }
 
 function moneyNumber(value) {
@@ -536,6 +729,7 @@ async function sendPayoutToProvider(payout) {
       currency: "USD",
       method: "cash_app",
       cashtag: payout.cashtag,
+      senderCashtag: OWNER_CASHAPP_CASHTAG,
       idempotencyKey: payout.id,
       purpose: "creator_services",
     }),
@@ -806,6 +1000,12 @@ export function createReferralRouter() {
       providerPayoutId: null,
       providerStatus: null,
       failureReason: null,
+      notifications: {
+        ownerRequestedAt: null,
+        approvedAt: null,
+        paidAt: null,
+        rejectedAt: null,
+      },
       createdAt: timestamp,
       approvedAt: null,
       paidAt: null,
@@ -815,6 +1015,16 @@ export function createReferralRouter() {
 
     store.payouts[payoutId] = payout;
     creator.updatedAt = timestamp;
+    await persist();
+
+    const ownerNotification = await sendOwnerPayoutRequestNotification(creator, payout);
+    payout.notifications ||= {};
+    if (ownerNotification.sent) {
+      payout.notifications.ownerRequestedAt = ownerNotification.sentAt || nowISO();
+      payout.notifications.ownerRequestedMessageId = ownerNotification.messageId || null;
+    } else {
+      payout.notifications.ownerRequestedError = ownerNotification.error || null;
+    }
     await persist();
 
     return res.status(201).json({
@@ -836,6 +1046,7 @@ export function createReferralRouter() {
       creators,
       payoutAutomationConfigured: payoutAutomationConfigured(),
       creatorEmailConfigured: creatorEmailConfigured(),
+      ownerCashAppCashtag: OWNER_CASHAPP_CASHTAG,
       contactEmail: CONTACT_EMAIL,
     });
   });
@@ -850,6 +1061,7 @@ export function createReferralRouter() {
     return res.json({
       ok: true,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      ownerCashAppCashtag: OWNER_CASHAPP_CASHTAG,
       payouts,
     });
   });
@@ -1165,6 +1377,13 @@ export function createReferralRouter() {
       payout.updatedAt = nowISO();
       await persist();
 
+      if (payout.status === "paid") {
+        await notifyPayoutOnce(payout, "paid");
+      } else if (["approved", "processing"].includes(payout.status)) {
+        await notifyPayoutOnce(payout, "approved");
+      }
+      await persist();
+
       return res.json({
         ok: true,
         automated: providerResult.mode === "automated",
@@ -1204,6 +1423,9 @@ export function createReferralRouter() {
     payout.updatedAt = nowISO();
     await persist();
 
+    await notifyPayoutOnce(payout, "rejected");
+    await persist();
+
     return res.json({
       ok: true,
       payout: payoutView(payout),
@@ -1229,6 +1451,9 @@ export function createReferralRouter() {
     payout.provider = payout.provider || "manual-cash-app";
     payout.providerStatus = "PAID_CONFIRMED_BY_OWNER";
     payout.updatedAt = nowISO();
+    await persist();
+
+    await notifyPayoutOnce(payout, "paid");
     await persist();
 
     return res.json({
