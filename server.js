@@ -2,13 +2,13 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
+import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";\nimport { createReferralRouter } from "./referrals.js";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json());\napp.use("/referrals", createReferralRouter());
 
 const PORT = process.env.PORT || 8080;
 
