@@ -17,6 +17,7 @@ import { createTaxRouter } from "./taxRouter.js";
 import { createOrderScanUsageStore, createUniversalOrderScanRouter } from "./universalOrderScanRouter.js";
 import { createEventRouter } from "./eventRouter.js";
 import { createDriverMapRouter } from "./driverMapRouter.js";
+import { createReferralRouter } from "./referrals.js";
 import { interpretTrustedEventRange, resolveTrustedTimeContext } from "./trustedTime.js";
 import {
   createGooglePlaySubscriptionVerifier,
@@ -88,6 +89,7 @@ applyHttpSecurity(app, {
   nodeEnv: NODE_ENV,
 });
 app.use(express.json({ limit: "3mb" }));
+app.use("/referrals", createReferralRouter());
 
 const PORT = process.env.PORT || 8080;
 
