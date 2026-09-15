@@ -382,25 +382,25 @@ async function sendOwnerReelReviewNotification(creator, reel) {
   const fee = moneyNumber(reel.plannedFee ?? creator.reelFee);
   return sendProgramEmail({
     to: CONTACT_EMAIL,
-    subject: \`GigProfit Reel #\${reel.number} Review — \${creator.name}\`,
-    title: \`Reel #\${reel.number} Submitted\`,
+    subject: `GigProfit Reel #${reel.number} Review — ${creator.name}`,
+    title: `Reel #${reel.number} Submitted`,
     textLines: [
-      \`Creator: \${creator.name}\`,
-      \`Platform: \${reel.platform || "Video"}\`,
-      \`Reel fee if approved: $\${fee.toFixed(2)}\`,
-      \`Video: \${reel.url}\`,
+      `Creator: ${creator.name}`,
+      `Platform: ${reel.platform || "Video"}`,
+      `Reel fee if approved: $${fee.toFixed(2)}`,
+      `Video: ${reel.url}`,
       "",
-      \`Review it here: \${OWNER_PORTAL_URL}\`,
+      `Review it here: ${OWNER_PORTAL_URL}`,
     ],
     htmlLines: [
-      \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
-        <p><strong>Creator:</strong> \${htmlEscape(creator.name)}</p>
-        <p><strong>Reel:</strong> #\${Number(reel.number || 1)}</p>
-        <p><strong>Platform:</strong> \${htmlEscape(reel.platform || "Video")}</p>
-        <p><strong>Reel fee if approved:</strong> $\${fee.toFixed(2)}</p>
-      </div>\`,
-      \`<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="\${htmlEscape(reel.url)}">Open submitted video</a></p>\`,
-      \`<p><a style="color:#69a3ff" href="\${htmlEscape(OWNER_PORTAL_URL)}">Open Owner Center to approve or reject</a></p>\`,
+      `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+        <p><strong>Creator:</strong> ${htmlEscape(creator.name)}</p>
+        <p><strong>Reel:</strong> #${Number(reel.number || 1)}</p>
+        <p><strong>Platform:</strong> ${htmlEscape(reel.platform || "Video")}</p>
+        <p><strong>Reel fee if approved:</strong> $${fee.toFixed(2)}</p>
+      </div>`,
+      `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(reel.url)}">Open submitted video</a></p>`,
+      `<p><a style="color:#69a3ff" href="${htmlEscape(OWNER_PORTAL_URL)}">Open Owner Center to approve or reject</a></p>`,
     ],
   });
 }
@@ -415,21 +415,21 @@ async function sendCreatorReelStatusNotification(creator, reel, type) {
   if (type === "approved") {
     return sendProgramEmail({
       to: creator.email,
-      subject: \`Your GigProfit Reel #\${reel.number} was approved — $\${fee.toFixed(2)} added\`,
-      title: \`Reel #\${reel.number} Approved\`,
+      subject: `Your GigProfit Reel #${reel.number} was approved — $${fee.toFixed(2)} added`,
+      title: `Reel #${reel.number} Approved`,
       textLines: [
-        \`Hi \${creator.name},\`,
+        `Hi ${creator.name},`,
         "Your GigProfit promotional Reel has been approved.",
-        \`Reel fee credited: $\${fee.toFixed(2)}\`,
-        \`Video: \${reel.url}\`,
+        `Reel fee credited: $${fee.toFixed(2)}`,
+        `Video: ${reel.url}`,
         "",
         "The Reel fee is now included in your GigProfit earnings.",
       ],
       htmlLines: [
-        \`<p>Hi \${htmlEscape(creator.name)},</p>\`,
-        \`<p>Your GigProfit promotional Reel #\${Number(reel.number || 1)} has been <strong>approved</strong>.</p>\`,
-        \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reel fee credited:</strong> $\${fee.toFixed(2)}</div>\`,
-        \`<p><a style="color:#69a3ff" href="\${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>\`,
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your GigProfit promotional Reel #${Number(reel.number || 1)} has been <strong>approved</strong>.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reel fee credited:</strong> $${fee.toFixed(2)}</div>`,
+        `<p><a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>`,
       ],
     });
   }
@@ -437,20 +437,20 @@ async function sendCreatorReelStatusNotification(creator, reel, type) {
   if (type === "rejected") {
     return sendProgramEmail({
       to: creator.email,
-      subject: \`Update on your GigProfit Reel #\${reel.number}\`,
-      title: \`Reel #\${reel.number} Needs Changes\`,
+      subject: `Update on your GigProfit Reel #${reel.number}`,
+      title: `Reel #${reel.number} Needs Changes`,
       textLines: [
-        \`Hi \${creator.name},\`,
+        `Hi ${creator.name},`,
         "Your submitted Reel was not approved.",
-        \`Reason: \${reel.rejectionReason || "Please contact Creator Support for details."}\`,
+        `Reason: ${reel.rejectionReason || "Please contact Creator Support for details."}`,
         "",
         "No Reel fee was credited. You can submit a corrected or new video for the same Reel opportunity.",
       ],
       htmlLines: [
-        \`<p>Hi \${htmlEscape(creator.name)},</p>\`,
-        \`<p>Your submitted Reel #\${Number(reel.number || 1)} was <strong>not approved</strong>.</p>\`,
-        \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> \${htmlEscape(reel.rejectionReason || "Please contact Creator Support for details.")}</div>\`,
-        \`<p style="color:#b8c0cf">No Reel fee was credited. You can submit a corrected video for this same opportunity.</p>\`,
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your submitted Reel #${Number(reel.number || 1)} was <strong>not approved</strong>.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> ${htmlEscape(reel.rejectionReason || "Please contact Creator Support for details.")}</div>`,
+        `<p style="color:#b8c0cf">No Reel fee was credited. You can submit a corrected video for this same opportunity.</p>`,
       ],
     });
   }
@@ -461,26 +461,26 @@ async function sendCreatorReelStatusNotification(creator, reel, type) {
 async function sendOwnerNextReelRequestNotification(creator, request) {
   return sendProgramEmail({
     to: CONTACT_EMAIL,
-    subject: \`GigProfit Reel #\${request.number} Opportunity Request — \${creator.name}\`,
-    title: \`Reel #\${request.number} Opportunity Request\`,
+    subject: `GigProfit Reel #${request.number} Opportunity Request — ${creator.name}`,
+    title: `Reel #${request.number} Opportunity Request`,
     textLines: [
-      \`Creator: \${creator.name}\`,
-      \`Lifetime paid: $\${moneyNumber(creator.metrics?.paidEarnings).toFixed(2)}\`,
-      \`Verified downloads: \${Number(creator.metrics?.installs || 0)}\`,
-      \`Minimum Reel fee: $\${moneyNumber(request.minimumFee).toFixed(2)}\`,
-      \`Suggested Reel fee: $\${moneyNumber(request.suggestedFee).toFixed(2)}\`,
+      `Creator: ${creator.name}`,
+      `Lifetime paid: $${moneyNumber(creator.metrics?.paidEarnings).toFixed(2)}`,
+      `Verified downloads: ${Number(creator.metrics?.installs || 0)}`,
+      `Minimum Reel fee: $${moneyNumber(request.minimumFee).toFixed(2)}`,
+      `Suggested Reel fee: $${moneyNumber(request.suggestedFee).toFixed(2)}`,
       "",
-      \`Approve or reject it here: \${OWNER_PORTAL_URL}\`,
+      `Approve or reject it here: ${OWNER_PORTAL_URL}`,
     ],
     htmlLines: [
-      \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
-        <p><strong>Creator:</strong> \${htmlEscape(creator.name)}</p>
-        <p><strong>Requested:</strong> Reel #\${Number(request.number)}</p>
-        <p><strong>Lifetime paid:</strong> $\${moneyNumber(creator.metrics?.paidEarnings).toFixed(2)}</p>
-        <p><strong>Verified downloads:</strong> \${Number(creator.metrics?.installs || 0)}</p>
-        <p><strong>Minimum fee:</strong> $\${moneyNumber(request.minimumFee).toFixed(2)}</p>
-      </div>\`,
-      \`<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="\${htmlEscape(OWNER_PORTAL_URL)}">Review Reel Opportunity</a></p>\`,
+      `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+        <p><strong>Creator:</strong> ${htmlEscape(creator.name)}</p>
+        <p><strong>Requested:</strong> Reel #${Number(request.number)}</p>
+        <p><strong>Lifetime paid:</strong> $${moneyNumber(creator.metrics?.paidEarnings).toFixed(2)}</p>
+        <p><strong>Verified downloads:</strong> ${Number(creator.metrics?.installs || 0)}</p>
+        <p><strong>Minimum fee:</strong> $${moneyNumber(request.minimumFee).toFixed(2)}</p>
+      </div>`,
+      `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(OWNER_PORTAL_URL)}">Review Reel Opportunity</a></p>`,
     ],
   });
 }
@@ -493,20 +493,20 @@ async function sendCreatorNextReelRequestStatus(creator, request, type) {
   if (type === "approved") {
     return sendProgramEmail({
       to: creator.email,
-      subject: \`GigProfit Reel #\${request.number} is unlocked\`,
-      title: \`Reel #\${request.number} Opportunity Approved\`,
+      subject: `GigProfit Reel #${request.number} is unlocked`,
+      title: `Reel #${request.number} Opportunity Approved`,
       textLines: [
-        \`Hi \${creator.name},\`,
-        \`Your request for another GigProfit Reel has been approved.\`,
-        \`Approved Reel fee: $\${moneyNumber(request.approvedFee).toFixed(2)}\`,
+        `Hi ${creator.name},`,
+        `Your request for another GigProfit Reel has been approved.`,
+        `Approved Reel fee: $${moneyNumber(request.approvedFee).toFixed(2)}`,
         "",
         "Publish the new GigProfit promotional video and submit its public link in your Creator Center. The fee is credited only after the finished video is reviewed and approved.",
       ],
       htmlLines: [
-        \`<p>Hi \${htmlEscape(creator.name)},</p>\`,
-        \`<p>Your Reel #\${Number(request.number)} opportunity has been <strong>approved</strong>.</p>\`,
-        \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Approved Reel fee:</strong> $\${moneyNumber(request.approvedFee).toFixed(2)}</div>\`,
-        \`<p><a style="color:#69a3ff" href="\${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>\`,
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your Reel #${Number(request.number)} opportunity has been <strong>approved</strong>.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Approved Reel fee:</strong> $${moneyNumber(request.approvedFee).toFixed(2)}</div>`,
+        `<p><a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>`,
       ],
     });
   }
@@ -514,17 +514,17 @@ async function sendCreatorNextReelRequestStatus(creator, request, type) {
   if (type === "rejected") {
     return sendProgramEmail({
       to: creator.email,
-      subject: \`Update on your GigProfit Reel #\${request.number} opportunity\`,
+      subject: `Update on your GigProfit Reel #${request.number} opportunity`,
       title: "Additional Reel Request Update",
       textLines: [
-        \`Hi \${creator.name},\`,
+        `Hi ${creator.name},`,
         "Your request for another paid GigProfit Reel was not approved at this time.",
-        \`Reason: \${request.rejectionReason || "Please contact Creator Support for details."}\`,
+        `Reason: ${request.rejectionReason || "Please contact Creator Support for details."}`,
       ],
       htmlLines: [
-        \`<p>Hi \${htmlEscape(creator.name)},</p>\`,
-        \`<p>Your request for Reel #\${Number(request.number)} was not approved at this time.</p>\`,
-        \`<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> \${htmlEscape(request.rejectionReason || "Please contact Creator Support for details.")}</div>\`,
+        `<p>Hi ${htmlEscape(creator.name)},</p>`,
+        `<p>Your request for Reel #${Number(request.number)} was not approved at this time.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> ${htmlEscape(request.rejectionReason || "Please contact Creator Support for details.")}</div>`,
       ],
     });
   }
@@ -686,7 +686,7 @@ function ensureCreatorShape(creator) {
   if (creator.reels.length === 0 && legacySubmission) {
     creator.reels.push({
       ...legacySubmission,
-      id: legacySubmission.id || \`reel_\${crypto.randomUUID()}\`,
+      id: legacySubmission.id || `reel_${crypto.randomUUID()}`,
       number: 1,
       attempt: 1,
       plannedFee: moneyNumber(
@@ -696,7 +696,7 @@ function ensureCreatorShape(creator) {
     });
   } else if (creator.reels.length === 0 && legacyCompleted) {
     creator.reels.push({
-      id: \`reel_\${crypto.randomUUID()}\`,
+      id: `reel_${crypto.randomUUID()}`,
       number: 1,
       attempt: 1,
       url: null,
@@ -717,7 +717,7 @@ function ensureCreatorShape(creator) {
 
   creator.reels = creator.reels.map((reel, index) => {
     const normalized = reel || {};
-    normalized.id = normalized.id || \`reel_\${crypto.randomUUID()}\`;
+    normalized.id = normalized.id || `reel_${crypto.randomUUID()}`;
     normalized.number = Math.max(1, Math.floor(Number(normalized.number || index + 1)));
     normalized.attempt = Math.max(1, Math.floor(Number(normalized.attempt || 1)));
     normalized.status = normalized.status || "pending";
@@ -1479,7 +1479,7 @@ export function createReferralRouter() {
 
     const timestamp = nowISO();
     const reel = {
-      id: \`reel_\${crypto.randomUUID()}\`,
+      id: `reel_${crypto.randomUUID()}`,
       number: nextNumber,
       attempt,
       url: normalizedUrl,
@@ -1555,7 +1555,7 @@ export function createReferralRouter() {
 
     const policy = eligibility.feePolicy;
     const request = {
-      id: \`reelreq_\${crypto.randomUUID()}\`,
+      id: `reelreq_${crypto.randomUUID()}`,
       number: policy.number,
       status: "requested",
       minimumFee: moneyNumber(policy.minimumFee),
@@ -2098,7 +2098,7 @@ export function createReferralRouter() {
 
       if (!Number.isFinite(approvedFee) || approvedFee < minimumFee) {
         return res.status(400).json({
-          error: \`Reel #\${request.number} fee cannot be below $\${minimumFee.toFixed(2)}\`,
+          error: `Reel #${request.number} fee cannot be below $${minimumFee.toFixed(2)}`,
           minimumFee,
         });
       }
@@ -2233,14 +2233,14 @@ export function createReferralRouter() {
       const fee = moneyNumber(req.body?.fee ?? policy.suggestedFee);
       if (!Number.isFinite(fee) || fee < policy.minimumFee) {
         return res.status(400).json({
-          error: \`Reel #\${policy.number} fee cannot be below $\${moneyNumber(policy.minimumFee).toFixed(2)}\`,
+          error: `Reel #${policy.number} fee cannot be below $${moneyNumber(policy.minimumFee).toFixed(2)}`,
           minimumFee: moneyNumber(policy.minimumFee),
         });
       }
 
       const timestamp = nowISO();
       const request = {
-        id: \`ownerunlock_\${crypto.randomUUID()}\`,
+        id: `ownerunlock_${crypto.randomUUID()}`,
         number: policy.number,
         status: "approved",
         minimumFee: moneyNumber(policy.minimumFee),
