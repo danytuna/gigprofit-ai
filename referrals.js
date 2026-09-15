@@ -28,8 +28,22 @@ const DATA_PATH =
 
 const MAX_RECENT_FINGERPRINTS = 1500;
 const UNIQUE_WINDOW_DAYS = 14;
-const DEFAULT_DOWNLOAD_BONUS = 1;
+const DEFAULT_ACCOUNT_BONUS = 1;
 const MIN_PAYOUT = Math.max(0, Number(process.env.REFERRAL_MIN_PAYOUT || 0));
+
+const STRIPE_API_VERSION =
+  process.env.STRIPE_API_VERSION ||
+  "2026-08-26.preview";
+const STRIPE_FINANCIAL_ACCOUNT_ID =
+  String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
+const PAYOUT_ESTIMATE_MIN_DAYS = Math.max(
+  1,
+  Math.floor(Number(process.env.CREATOR_PAYOUT_ESTIMATE_MIN_DAYS || 1))
+);
+const PAYOUT_ESTIMATE_MAX_DAYS = Math.max(
+  PAYOUT_ESTIMATE_MIN_DAYS,
+  Math.floor(Number(process.env.CREATOR_PAYOUT_ESTIMATE_MAX_DAYS || 3))
+);
 
 const REEL_NEXT_MIN_LIFETIME_PAID = Math.max(
   0,
@@ -73,10 +87,11 @@ let creatorMailer = null;
 
 let loaded = false;
 let store = {
-  version: 2,
+  version: 3,
   updatedAt: null,
   creators: {},
   payouts: {},
+  accountAttributions: {},
 };
 
 let writeQueue = Promise.resolve();
@@ -230,10 +245,10 @@ function creatorInvitationMessage(creator, accessKey) {
     "",
     "Compensation:",
     `Reel fee: ${moneyNumber(creator.reelFee).toFixed(2)}`,
-    `Verified download bonus: ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download`,
+    `Valid account-created bonus: ${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created`,
     "",
     "Use only the referral code in the Referral code field — do not paste the full referral URL.",
-    "Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.",
+    "Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.",
     "",
     `Creator support: ${CONTACT_EMAIL}`,
     "",
@@ -263,11 +278,11 @@ function creatorInvitationMessage(creator, accessKey) {
         <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
           <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Compensation</div>
           <p><strong>Reel fee:</strong> ${moneyNumber(creator.reelFee).toFixed(2)}</p>
-          <p><strong>Verified download bonus:</strong> ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download</p>
+          <p><strong>Valid account-created bonus:</strong> ${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created</p>
         </div>
 
         <p style="color:#b8c0cf"><strong>Important:</strong> In the Referral code field, enter only <strong>${htmlEscape(creator.code)}</strong>, not the full referral URL.</p>
-        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.</p>
+        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.</p>
         <p style="color:#8f9aab;margin-top:28px">Creator support: <a style="color:#69a3ff" href="mailto:${htmlEscape(CONTACT_EMAIL)}">${htmlEscape(CONTACT_EMAIL)}</a></p>
         <div style="color:#687284;font-size:12px;margin-top:26px">GigProfit · Nova Prime LLC</div>
       </div>
@@ -667,11 +682,14 @@ function ensureCreatorShape(creator) {
   creator.recentFingerprints ||= [];
   creator.cashApp ||= {};
   creator.reelFee = moneyNumber(creator.reelFee);
-  creator.downloadBonus = moneyNumber(
+  creator.accountBonus = moneyNumber(
+    creator.accountBonus ??
     creator.downloadBonus ??
     creator.commissionPerDownload ??
-    DEFAULT_DOWNLOAD_BONUS
+    DEFAULT_ACCOUNT_BONUS
   );
+  // Legacy field retained only for old stored records/UI compatibility.
+  creator.downloadBonus = creator.accountBonus;
 
   const legacySubmission =
     creator.reelSubmission && typeof creator.reelSubmission === "object"
@@ -768,6 +786,7 @@ function ensureCreatorShape(creator) {
   creator.metrics.clicks = Number(creator.metrics.clicks || 0);
   creator.metrics.uniqueClicks = Number(creator.metrics.uniqueClicks || 0);
   creator.metrics.installs = Number(creator.metrics.installs || 0);
+  creator.metrics.accountsCreated = Number(creator.metrics.accountsCreated || 0);
   creator.metrics.subscriptions = Number(creator.metrics.subscriptions || 0);
   creator.metrics.revenue = moneyNumber(creator.metrics.revenue || 0);
   creator.metrics.paidEarnings = moneyNumber(
@@ -783,21 +802,41 @@ function ensureCreatorShape(creator) {
   creator.cashApp.providerGrantId = creator.cashApp.providerGrantId || null;
   creator.cashApp.updatedAt = creator.cashApp.updatedAt || null;
 
+  creator.bankPayout ||= {};
+  creator.bankPayout.provider =
+    creator.bankPayout.provider || "stripe_global_payouts";
+  creator.bankPayout.recipientId = creator.bankPayout.recipientId || null;
+  creator.bankPayout.payoutMethodId = creator.bankPayout.payoutMethodId || null;
+  creator.bankPayout.connected = Boolean(creator.bankPayout.connected);
+  creator.bankPayout.status =
+    creator.bankPayout.status ||
+    (creator.bankPayout.connected ? "connected" : "not_connected");
+  creator.bankPayout.bankName = creator.bankPayout.bankName || null;
+  creator.bankPayout.last4 = creator.bankPayout.last4 || null;
+  creator.bankPayout.updatedAt = creator.bankPayout.updatedAt || null;
+  creator.bankPayout.onboardingStartedAt =
+    creator.bankPayout.onboardingStartedAt || null;
+
   creator.invitation ||= {};
   creator.invitation.lastSentAt = creator.invitation.lastSentAt || null;
   creator.invitation.lastMessageId = creator.invitation.lastMessageId || null;
   creator.invitation.lastError = creator.invitation.lastError || null;
   creator.invitation.delivery = creator.invitation.delivery || "not_sent";
+  creator.invitation.sendCount = Math.max(
+    0,
+    Math.floor(Number(creator.invitation.sendCount || 0))
+  );
 
   return creator;
 }
 
 function ensureStoreShape(parsed = {}) {
   const next = {
-    version: 2,
+    version: 3,
     updatedAt: parsed?.updatedAt || null,
     creators: parsed?.creators || {},
     payouts: parsed?.payouts || {},
+    accountAttributions: parsed?.accountAttributions || {},
   };
 
   for (const creator of Object.values(next.creators)) {
@@ -1033,9 +1072,10 @@ function earningsForCreator(creator) {
       0
     )
   );
-  const downloadEarnings =
-    Number(creator.metrics.installs || 0) * Number(creator.downloadBonus || 0);
-  const grossEarnings = moneyNumber(reelEarnings + downloadEarnings);
+  const accountEarnings =
+    Number(creator.metrics.accountsCreated || 0) *
+    Number(creator.accountBonus || 0);
+  const grossEarnings = moneyNumber(reelEarnings + accountEarnings);
   const paidEarnings = moneyNumber(creator.metrics.paidEarnings || 0);
   const pendingPayouts = reservedAmountForCreator(creator.code);
   const availableEarnings = moneyNumber(
@@ -1044,7 +1084,9 @@ function earningsForCreator(creator) {
 
   return {
     reelEarnings,
-    downloadEarnings: moneyNumber(downloadEarnings),
+    accountEarnings: moneyNumber(accountEarnings),
+    // Downloads remain analytics only. Legacy value is always zero.
+    downloadEarnings: 0,
     grossEarnings,
     paidEarnings,
     pendingPayouts,
@@ -1134,8 +1176,23 @@ function creatorView(creator, includePrivate = false) {
       nextRequest: creator.reelProgram.nextRequest || null,
       activeOpportunity: creator.reelProgram.activeOpportunity || null,
     },
-    downloadBonus: moneyNumber(creator.downloadBonus),
+    accountBonus: moneyNumber(creator.accountBonus),
+    // Deprecated compatibility alias; compensation is based on accounts created.
+    downloadBonus: moneyNumber(creator.accountBonus),
     minimumPayout: MIN_PAYOUT,
+    payoutEstimate: {
+      minBusinessDays: PAYOUT_ESTIMATE_MIN_DAYS,
+      maxBusinessDays: PAYOUT_ESTIMATE_MAX_DAYS,
+      label: `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
+    },
+    bankPayout: {
+      connected: Boolean(creator.bankPayout?.connected),
+      status: creator.bankPayout?.status || "not_connected",
+      provider: creator.bankPayout?.provider || "stripe_global_payouts",
+      bankName: creator.bankPayout?.bankName || null,
+      last4: creator.bankPayout?.last4 || null,
+      updatedAt: creator.bankPayout?.updatedAt || null,
+    },
     cashApp: {
       cashtag: creator.cashApp?.cashtag || null,
       connected: Boolean(creator.cashApp?.connected),
@@ -1146,6 +1203,7 @@ function creatorView(creator, includePrivate = false) {
       clicks: Number(creator.metrics?.clicks || 0),
       uniqueClicks: Number(creator.metrics?.uniqueClicks || 0),
       installs: Number(creator.metrics?.installs || 0),
+      accountsCreated: Number(creator.metrics?.accountsCreated || 0),
       subscriptions: Number(creator.metrics?.subscriptions || 0),
       revenue: moneyNumber(creator.metrics?.revenue || 0),
       ...earnings,
@@ -1162,9 +1220,12 @@ function creatorView(creator, includePrivate = false) {
       delivery: creator.invitation?.delivery || "not_sent",
       lastSentAt: creator.invitation?.lastSentAt || null,
       lastError: creator.invitation?.lastError || null,
+      sendCount: Number(creator.invitation?.sendCount || 0),
     };
     view.cashApp.providerCustomerId = creator.cashApp?.providerCustomerId || null;
     view.cashApp.providerGrantId = creator.cashApp?.providerGrantId || null;
+    view.bankPayout.recipientId = creator.bankPayout?.recipientId || null;
+    view.bankPayout.payoutMethodId = creator.bankPayout?.payoutMethodId || null;
   }
 
   return view;
@@ -1779,6 +1840,18 @@ export function createReferralRouter() {
       return res.status(400).json({ error: "Name and creator email are required" });
     }
 
+    const existingCreator = Object.values(store.creators).find(
+      (item) => normalizeEmail(item?.email) === email
+    );
+    if (existingCreator) {
+      ensureCreatorShape(existingCreator);
+      return res.status(409).json({
+        error: "Creator already exists with this email",
+        code: "CREATOR_EMAIL_EXISTS",
+        creator: creatorView(existingCreator, true),
+      });
+    }
+
     const requestedCode = slugify(req.body?.code || name);
     if (!requestedCode) {
       return res.status(400).json({ error: "A valid referral code is required" });
@@ -1803,9 +1876,13 @@ export function createReferralRouter() {
         nextRequest: null,
         activeOpportunity: null,
       },
-      downloadBonus: Math.max(
+      accountBonus: Math.max(
         0,
-        moneyNumber(req.body?.downloadBonus ?? DEFAULT_DOWNLOAD_BONUS)
+        moneyNumber(
+          req.body?.accountBonus ??
+          req.body?.downloadBonus ??
+          DEFAULT_ACCOUNT_BONUS
+        )
       ),
       accessKeyHash: hashSecret(accessKey),
       notes: String(req.body?.notes || "").trim(),
@@ -1817,10 +1894,22 @@ export function createReferralRouter() {
         providerGrantId: null,
         updatedAt: null,
       },
+      bankPayout: {
+        provider: "stripe_global_payouts",
+        recipientId: null,
+        payoutMethodId: null,
+        connected: false,
+        status: "not_connected",
+        bankName: null,
+        last4: null,
+        updatedAt: null,
+        onboardingStartedAt: null,
+      },
       metrics: {
         clicks: 0,
         uniqueClicks: 0,
         installs: 0,
+        accountsCreated: 0,
         subscriptions: 0,
         revenue: 0,
         paidEarnings: 0,
@@ -1846,6 +1935,7 @@ export function createReferralRouter() {
       creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
       creator.invitation.lastMessageId = invitationEmail.messageId || null;
       creator.invitation.lastError = null;
+      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
     } else {
       creator.invitation.delivery = invitationEmail.configured ? "failed" : "not_configured";
       creator.invitation.lastError = invitationEmail.error || null;
@@ -1883,6 +1973,18 @@ export function createReferralRouter() {
       if (!email.includes("@")) {
         return res.status(400).json({ error: "Invalid email" });
       }
+      const duplicate = Object.values(store.creators).find(
+        (item) =>
+          item !== creator &&
+          normalizeEmail(item?.email) === email
+      );
+      if (duplicate) {
+        return res.status(409).json({
+          error: "Another creator already uses this email",
+          code: "CREATOR_EMAIL_EXISTS",
+          creator: creatorView(duplicate, true),
+        });
+      }
       creator.email = email;
     }
 
@@ -1902,8 +2004,15 @@ export function createReferralRouter() {
       creator.reelFee = Math.max(0, moneyNumber(req.body.reelFee));
     }
 
-    if (req.body?.downloadBonus !== undefined) {
-      creator.downloadBonus = Math.max(0, moneyNumber(req.body.downloadBonus));
+    if (
+      req.body?.accountBonus !== undefined ||
+      req.body?.downloadBonus !== undefined
+    ) {
+      creator.accountBonus = Math.max(
+        0,
+        moneyNumber(req.body?.accountBonus ?? req.body?.downloadBonus)
+      );
+      creator.downloadBonus = creator.accountBonus;
     }
 
     if (req.body?.reelCompleted !== undefined) {
@@ -2301,7 +2410,7 @@ export function createReferralRouter() {
 
       ensureCreatorShape(creator);
 
-      for (const field of ["installs", "subscriptions", "revenue"]) {
+      for (const field of ["installs", "accountsCreated", "subscriptions", "revenue"]) {
         if (req.body?.[field] !== undefined) {
           const value = Number(req.body[field]);
           if (!Number.isFinite(value) || value < 0) {
@@ -2367,6 +2476,7 @@ export function createReferralRouter() {
       creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
       creator.invitation.lastMessageId = invitationEmail.messageId || null;
       creator.invitation.lastError = null;
+      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
       creator.updatedAt = nowISO();
       await persist();
 
