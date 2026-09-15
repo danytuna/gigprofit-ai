@@ -1765,8 +1765,15 @@ function finalizePaidPayout(payout) {
   creator.updatedAt = nowISO();
 }
 
-export function createReferralRouter() {
+export function createReferralRouter({ requireFirebaseAuth } = {}) {
   const router = express.Router();
+  const requireReferralAccountAuth =
+    typeof requireFirebaseAuth === "function"
+      ? requireFirebaseAuth
+      : (_req, res) =>
+          res.status(503).json({
+            error: "Account attribution authentication is unavailable",
+          });
 
   router.get("/health", async (_req, res) => {
     await ensureLoaded();
@@ -1832,6 +1839,66 @@ export function createReferralRouter() {
       redirectUrl: creator.campaignUrl || APP_STORE_URL,
     });
   });
+
+  router.post(
+    "/account-created/:code",
+    requireReferralAccountAuth,
+    async (req, res) => {
+      await ensureLoaded();
+
+      const code = slugify(req.params.code);
+      const creator = store.creators[code];
+
+      if (!creator || creator.status !== "active") {
+        return res.status(404).json({ error: "Referral creator not found" });
+      }
+
+      const uid = String(req.auth?.uid || "").trim();
+      if (!uid) {
+        return res.status(401).json({ error: "Authenticated account required" });
+      }
+
+      ensureCreatorShape(creator);
+      store.accountAttributions ||= {};
+
+      const attributionKey = hashSecret(
+        `gigprofit-account-attribution:${uid}`
+      );
+      const existing = store.accountAttributions[attributionKey];
+
+      if (existing) {
+        return res.json({
+          ok: true,
+          counted: false,
+          alreadyCounted: true,
+          creatorCode: existing.creatorCode,
+          sameCreator: existing.creatorCode === code,
+        });
+      }
+
+      store.accountAttributions[attributionKey] = {
+        creatorCode: code,
+        createdAt: nowISO(),
+        emailHash: req.auth?.email
+          ? hashSecret(
+              `gigprofit-account-email:${normalizeEmail(req.auth.email)}`
+            )
+          : null,
+      };
+
+      creator.metrics.accountsCreated =
+        Number(creator.metrics.accountsCreated || 0) + 1;
+      creator.updatedAt = nowISO();
+      await persist();
+
+      return res.status(201).json({
+        ok: true,
+        counted: true,
+        creatorCode: code,
+        accountsCreated: creator.metrics.accountsCreated,
+      });
+    }
+  );
 
   router.post("/creator/login", async (req, res) => {
     await ensureLoaded();
