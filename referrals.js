@@ -3997,6 +3997,18 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
           providerResult.raw?.error ||
           providerResult.raw?.message ||
           "Payout provider declined the payout";
+      } else if (providerResult.status === "funding") {
+        payout.status = "funding";
+        payout.fundingInboundTransferId =
+          providerResult.fundingInboundTransferId ||
+          payout.fundingInboundTransferId ||
+          null;
+        payout.fundingAmountCents =
+          providerResult.fundingAmountCents ||
+          payout.fundingAmountCents ||
+          0;
+        payout.fundingStartedAt = payout.fundingStartedAt || nowISO();
+        payout.fundingStatus = "pending";
       } else if (providerResult.status === "processing") {
         payout.status = "processing";
       } else {
@@ -4008,7 +4020,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
 
       if (payout.status === "paid") {
         await notifyPayoutOnce(payout, "paid");
-      } else if (["approved", "processing"].includes(payout.status)) {
+      } else if (["approved", "funding", "processing"].includes(payout.status)) {
         await notifyPayoutOnce(payout, "approved");
       }
       await persist();
@@ -4072,7 +4084,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       return res.status(404).json({ error: "Payout not found" });
     }
 
-    if (!["requested", "approved", "processing"].includes(payout.status)) {
+    if (!["requested", "approved", "funding", "processing"].includes(payout.status)) {
       return res.status(409).json({
         error: `Cannot mark a payout in ${payout.status} state as paid`,
       });
