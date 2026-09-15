@@ -28,8 +28,22 @@ const DATA_PATH =
 
 const MAX_RECENT_FINGERPRINTS = 1500;
 const UNIQUE_WINDOW_DAYS = 14;
-const DEFAULT_DOWNLOAD_BONUS = 1;
+const DEFAULT_ACCOUNT_BONUS = 1;
 const MIN_PAYOUT = Math.max(0, Number(process.env.REFERRAL_MIN_PAYOUT || 0));
+
+const STRIPE_API_VERSION =
+  process.env.STRIPE_API_VERSION ||
+  "2026-08-26.preview";
+const STRIPE_FINANCIAL_ACCOUNT_ID =
+  String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
+const PAYOUT_ESTIMATE_MIN_DAYS = Math.max(
+  1,
+  Math.floor(Number(process.env.CREATOR_PAYOUT_ESTIMATE_MIN_DAYS || 1))
+);
+const PAYOUT_ESTIMATE_MAX_DAYS = Math.max(
+  PAYOUT_ESTIMATE_MIN_DAYS,
+  Math.floor(Number(process.env.CREATOR_PAYOUT_ESTIMATE_MAX_DAYS || 3))
+);
 
 const REEL_NEXT_MIN_LIFETIME_PAID = Math.max(
   0,
@@ -73,10 +87,11 @@ let creatorMailer = null;
 
 let loaded = false;
 let store = {
-  version: 2,
+  version: 3,
   updatedAt: null,
   creators: {},
   payouts: {},
+  accountAttributions: {},
 };
 
 let writeQueue = Promise.resolve();
@@ -229,11 +244,11 @@ function creatorInvitationMessage(creator, accessKey) {
     referralUrl,
     "",
     "Compensation:",
-    `Reel fee: ${moneyNumber(creator.reelFee).toFixed(2)}`,
-    `Verified download bonus: ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download`,
+    `Reel fee: $${moneyNumber(creator.reelFee).toFixed(2)}`,
+    `Valid account-created bonus: $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created`,
     "",
     "Use only the referral code in the Referral code field — do not paste the full referral URL.",
-    "Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.",
+    "Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.",
     "",
     `Creator support: ${CONTACT_EMAIL}`,
     "",
@@ -262,12 +277,12 @@ function creatorInvitationMessage(creator, accessKey) {
 
         <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
           <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Compensation</div>
-          <p><strong>Reel fee:</strong> ${moneyNumber(creator.reelFee).toFixed(2)}</p>
-          <p><strong>Verified download bonus:</strong> ${moneyNumber(creator.downloadBonus).toFixed(2)} per verified download</p>
+          <p><strong>Reel fee:</strong> $${moneyNumber(creator.reelFee).toFixed(2)}</p>
+          <p><strong>Valid account-created bonus:</strong> $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created</p>
         </div>
 
         <p style="color:#b8c0cf"><strong>Important:</strong> In the Referral code field, enter only <strong>${htmlEscape(creator.code)}</strong>, not the full referral URL.</p>
-        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows verified downloads, earnings, available balance, and Cash Out requests.</p>
+        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.</p>
         <p style="color:#8f9aab;margin-top:28px">Creator support: <a style="color:#69a3ff" href="mailto:${htmlEscape(CONTACT_EMAIL)}">${htmlEscape(CONTACT_EMAIL)}</a></p>
         <div style="color:#687284;font-size:12px;margin-top:26px">GigProfit · Nova Prime LLC</div>
       </div>
@@ -533,6 +548,13 @@ async function sendCreatorNextReelRequestStatus(creator, request, type) {
 }
 
 async function sendOwnerPayoutRequestNotification(creator, payout) {
+  const destination =
+    payout.method === "bank_account"
+      ? [payout.bankName, payout.bankLast4 ? `•••• ${payout.bankLast4}` : null]
+          .filter(Boolean)
+          .join(" ")
+      : payout.cashtag || "Payout destination";
+
   return sendProgramEmail({
     to: CONTACT_EMAIL,
     subject: `New GigProfit Cash Out Request — $${moneyNumber(payout.amount).toFixed(2)} — ${creator.name}`,
@@ -540,31 +562,46 @@ async function sendOwnerPayoutRequestNotification(creator, payout) {
     textLines: [
       `Creator: ${creator.name}`,
       `Amount: $${moneyNumber(payout.amount).toFixed(2)}`,
-      `Cash App destination: ${payout.cashtag}`,
+      `Destination: ${destination}`,
+      `Method: ${payout.method === "bank_account" ? "Bank account via Stripe" : "Legacy Cash App"}`,
       `Payout ID: ${payout.id}`,
       "",
+      `Estimated bank arrival after approval: ${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days (estimate)`,
       `Review and approve or reject it here: ${OWNER_PORTAL_URL}`,
-      `Your payout source: ${OWNER_CASHAPP_CASHTAG}`,
     ],
     htmlLines: [
       `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
         <p><strong>Creator:</strong> ${htmlEscape(creator.name)}</p>
         <p><strong>Amount:</strong> $${moneyNumber(payout.amount).toFixed(2)}</p>
-        <p><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</p>
+        <p><strong>Destination:</strong> ${htmlEscape(destination)}</p>
+        <p><strong>Method:</strong> ${payout.method === "bank_account" ? "Bank account via Stripe" : "Legacy Cash App"}</p>
         <p><strong>Payout ID:</strong> ${htmlEscape(payout.id)}</p>
       </div>`,
+      `<p><strong>Estimated arrival:</strong> ${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days after approval. Bank processing times, weekends and holidays can affect delivery.</p>`,
       `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(OWNER_PORTAL_URL)}">Review Cash Out</a></p>`,
-      `<p style="color:#8f9aab">Payout source configured for Nova Prime: <strong>${htmlEscape(OWNER_CASHAPP_CASHTAG)}</strong></p>`,
     ],
   });
 }
 
 async function sendCreatorPayoutStatusNotification(creator, payout, type) {
   if (!creator?.email) {
-    return { configured: creatorEmailConfigured(), sent: false, error: "Creator email missing" };
+    return {
+      configured: creatorEmailConfigured(),
+      sent: false,
+      error: "Creator email missing",
+    };
   }
 
   const amount = moneyNumber(payout.amount).toFixed(2);
+  const destination =
+    payout.method === "bank_account"
+      ? [payout.bankName, payout.bankLast4 ? `•••• ${payout.bankLast4}` : null]
+          .filter(Boolean)
+          .join(" ")
+      : payout.cashtag || "Payout destination";
+  const arrival =
+    payout.expectedArrivalDate ||
+    `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`;
 
   if (type === "approved") {
     return sendProgramEmail({
@@ -574,15 +611,19 @@ async function sendCreatorPayoutStatusNotification(creator, payout, type) {
       textLines: [
         `Hi ${creator.name},`,
         `Your Cash Out request for $${amount} has been approved.`,
-        `Cash App destination: ${payout.cashtag}`,
+        `Destination: ${destination}`,
+        `Estimated arrival: ${arrival}`,
         "",
-        "Your payout is being processed. You will receive another confirmation when it is marked paid.",
+        "Your payout is being processed. Bank processing times, weekends and holidays may affect the delivery date.",
       ],
       htmlLines: [
         `<p>Hi ${htmlEscape(creator.name)},</p>`,
         `<p>Your Cash Out request for <strong>$${amount}</strong> has been approved.</p>`,
-        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</div>`,
-        `<p style="color:#b8c0cf">You will receive another confirmation when the payout is marked paid.</p>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+          <p><strong>Destination:</strong> ${htmlEscape(destination)}</p>
+          <p><strong>Estimated arrival:</strong> ${htmlEscape(arrival)}</p>
+        </div>`,
+        `<p style="color:#b8c0cf">Approval means the payout has been released for processing; it does not mean your bank has received it yet.</p>`,
       ],
     });
   }
@@ -594,15 +635,21 @@ async function sendCreatorPayoutStatusNotification(creator, payout, type) {
       title: "Payout Sent",
       textLines: [
         `Hi ${creator.name},`,
-        `Your GigProfit payout of $${amount} has been marked paid.`,
-        `Cash App destination: ${payout.cashtag}`,
+        `Your GigProfit payout of $${amount} has been sent.`,
+        `Destination: ${destination}`,
+        payout.expectedArrivalDate
+          ? `Stripe expected arrival: ${payout.expectedArrivalDate}`
+          : `Typical bank arrival: ${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
         "",
         "You can view the payout in your Creator Center history.",
       ],
       htmlLines: [
         `<p>Hi ${htmlEscape(creator.name)},</p>`,
         `<p>Your GigProfit payout of <strong>$${amount}</strong> has been sent.</p>`,
-        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Cash App destination:</strong> ${htmlEscape(payout.cashtag)}</div>`,
+        `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">
+          <p><strong>Destination:</strong> ${htmlEscape(destination)}</p>
+          <p><strong>Estimated arrival:</strong> ${htmlEscape(arrival)}</p>
+        </div>`,
         `<p><a style="color:#69a3ff" href="${htmlEscape(CREATOR_PORTAL_URL)}">Open Creator Center</a></p>`,
       ],
     });
@@ -611,7 +658,7 @@ async function sendCreatorPayoutStatusNotification(creator, payout, type) {
   if (type === "rejected") {
     return sendProgramEmail({
       to: creator.email,
-      subject: `Update on your GigProfit Cash Out request`,
+      subject: "Update on your GigProfit Cash Out request",
       title: "Cash Out Request Update",
       textLines: [
         `Hi ${creator.name},`,
@@ -624,12 +671,16 @@ async function sendCreatorPayoutStatusNotification(creator, payout, type) {
         `<p>Hi ${htmlEscape(creator.name)},</p>`,
         `<p>Your Cash Out request for <strong>$${amount}</strong> was not approved.</p>`,
         `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0"><strong>Reason:</strong> ${htmlEscape(payout.failureReason || "Contact Creator Support for details.")}</div>`,
-        `<p style="color:#b8c0cf">The reserved amount has been returned to your available balance.</p>`,
+        '<p style="color:#b8c0cf">The reserved amount has been returned to your available balance.</p>',
       ],
     });
   }
 
-  return { configured: creatorEmailConfigured(), sent: false, error: "Unknown payout notification type" };
+  return {
+    configured: creatorEmailConfigured(),
+    sent: false,
+    error: "Unknown payout notification type",
+  };
 }
 
 async function notifyPayoutOnce(payout, type) {
@@ -667,11 +718,14 @@ function ensureCreatorShape(creator) {
   creator.recentFingerprints ||= [];
   creator.cashApp ||= {};
   creator.reelFee = moneyNumber(creator.reelFee);
-  creator.downloadBonus = moneyNumber(
+  creator.accountBonus = moneyNumber(
+    creator.accountBonus ??
     creator.downloadBonus ??
     creator.commissionPerDownload ??
-    DEFAULT_DOWNLOAD_BONUS
+    DEFAULT_ACCOUNT_BONUS
   );
+  // Legacy field retained only for old stored records/UI compatibility.
+  creator.downloadBonus = creator.accountBonus;
 
   const legacySubmission =
     creator.reelSubmission && typeof creator.reelSubmission === "object"
@@ -768,6 +822,7 @@ function ensureCreatorShape(creator) {
   creator.metrics.clicks = Number(creator.metrics.clicks || 0);
   creator.metrics.uniqueClicks = Number(creator.metrics.uniqueClicks || 0);
   creator.metrics.installs = Number(creator.metrics.installs || 0);
+  creator.metrics.accountsCreated = Number(creator.metrics.accountsCreated || 0);
   creator.metrics.subscriptions = Number(creator.metrics.subscriptions || 0);
   creator.metrics.revenue = moneyNumber(creator.metrics.revenue || 0);
   creator.metrics.paidEarnings = moneyNumber(
@@ -783,21 +838,41 @@ function ensureCreatorShape(creator) {
   creator.cashApp.providerGrantId = creator.cashApp.providerGrantId || null;
   creator.cashApp.updatedAt = creator.cashApp.updatedAt || null;
 
+  creator.bankPayout ||= {};
+  creator.bankPayout.provider =
+    creator.bankPayout.provider || "stripe_global_payouts";
+  creator.bankPayout.recipientId = creator.bankPayout.recipientId || null;
+  creator.bankPayout.payoutMethodId = creator.bankPayout.payoutMethodId || null;
+  creator.bankPayout.connected = Boolean(creator.bankPayout.connected);
+  creator.bankPayout.status =
+    creator.bankPayout.status ||
+    (creator.bankPayout.connected ? "connected" : "not_connected");
+  creator.bankPayout.bankName = creator.bankPayout.bankName || null;
+  creator.bankPayout.last4 = creator.bankPayout.last4 || null;
+  creator.bankPayout.updatedAt = creator.bankPayout.updatedAt || null;
+  creator.bankPayout.onboardingStartedAt =
+    creator.bankPayout.onboardingStartedAt || null;
+
   creator.invitation ||= {};
   creator.invitation.lastSentAt = creator.invitation.lastSentAt || null;
   creator.invitation.lastMessageId = creator.invitation.lastMessageId || null;
   creator.invitation.lastError = creator.invitation.lastError || null;
   creator.invitation.delivery = creator.invitation.delivery || "not_sent";
+  creator.invitation.sendCount = Math.max(
+    0,
+    Math.floor(Number(creator.invitation.sendCount || 0))
+  );
 
   return creator;
 }
 
 function ensureStoreShape(parsed = {}) {
   const next = {
-    version: 2,
+    version: 3,
     updatedAt: parsed?.updatedAt || null,
     creators: parsed?.creators || {},
     payouts: parsed?.payouts || {},
+    accountAttributions: parsed?.accountAttributions || {},
   };
 
   for (const creator of Object.values(next.creators)) {
@@ -1033,9 +1108,10 @@ function earningsForCreator(creator) {
       0
     )
   );
-  const downloadEarnings =
-    Number(creator.metrics.installs || 0) * Number(creator.downloadBonus || 0);
-  const grossEarnings = moneyNumber(reelEarnings + downloadEarnings);
+  const accountEarnings =
+    Number(creator.metrics.accountsCreated || 0) *
+    Number(creator.accountBonus || 0);
+  const grossEarnings = moneyNumber(reelEarnings + accountEarnings);
   const paidEarnings = moneyNumber(creator.metrics.paidEarnings || 0);
   const pendingPayouts = reservedAmountForCreator(creator.code);
   const availableEarnings = moneyNumber(
@@ -1044,7 +1120,9 @@ function earningsForCreator(creator) {
 
   return {
     reelEarnings,
-    downloadEarnings: moneyNumber(downloadEarnings),
+    accountEarnings: moneyNumber(accountEarnings),
+    // Downloads remain analytics only. Legacy value is always zero.
+    downloadEarnings: 0,
     grossEarnings,
     paidEarnings,
     pendingPayouts,
@@ -1101,11 +1179,17 @@ function payoutView(payout) {
     creatorName: payout.creatorName,
     amount: moneyNumber(payout.amount),
     method: payout.method,
-    cashtag: payout.cashtag,
+    cashtag: payout.cashtag || null,
+    bankName: payout.bankName || null,
+    bankLast4: payout.bankLast4 || null,
     status: payout.status,
     provider: payout.provider || null,
     providerPayoutId: payout.providerPayoutId || null,
     providerStatus: payout.providerStatus || null,
+    expectedArrivalDate: payout.expectedArrivalDate || null,
+    estimatedArrival:
+      payout.estimatedArrival ||
+      `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
     createdAt: payout.createdAt,
     approvedAt: payout.approvedAt || null,
     paidAt: payout.paidAt || null,
@@ -1134,8 +1218,23 @@ function creatorView(creator, includePrivate = false) {
       nextRequest: creator.reelProgram.nextRequest || null,
       activeOpportunity: creator.reelProgram.activeOpportunity || null,
     },
-    downloadBonus: moneyNumber(creator.downloadBonus),
+    accountBonus: moneyNumber(creator.accountBonus),
+    // Deprecated compatibility alias; compensation is based on accounts created.
+    downloadBonus: moneyNumber(creator.accountBonus),
     minimumPayout: MIN_PAYOUT,
+    payoutEstimate: {
+      minBusinessDays: PAYOUT_ESTIMATE_MIN_DAYS,
+      maxBusinessDays: PAYOUT_ESTIMATE_MAX_DAYS,
+      label: `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
+    },
+    bankPayout: {
+      connected: Boolean(creator.bankPayout?.connected),
+      status: creator.bankPayout?.status || "not_connected",
+      provider: creator.bankPayout?.provider || "stripe_global_payouts",
+      bankName: creator.bankPayout?.bankName || null,
+      last4: creator.bankPayout?.last4 || null,
+      updatedAt: creator.bankPayout?.updatedAt || null,
+    },
     cashApp: {
       cashtag: creator.cashApp?.cashtag || null,
       connected: Boolean(creator.cashApp?.connected),
@@ -1146,6 +1245,7 @@ function creatorView(creator, includePrivate = false) {
       clicks: Number(creator.metrics?.clicks || 0),
       uniqueClicks: Number(creator.metrics?.uniqueClicks || 0),
       installs: Number(creator.metrics?.installs || 0),
+      accountsCreated: Number(creator.metrics?.accountsCreated || 0),
       subscriptions: Number(creator.metrics?.subscriptions || 0),
       revenue: moneyNumber(creator.metrics?.revenue || 0),
       ...earnings,
@@ -1162,9 +1262,12 @@ function creatorView(creator, includePrivate = false) {
       delivery: creator.invitation?.delivery || "not_sent",
       lastSentAt: creator.invitation?.lastSentAt || null,
       lastError: creator.invitation?.lastError || null,
+      sendCount: Number(creator.invitation?.sendCount || 0),
     };
     view.cashApp.providerCustomerId = creator.cashApp?.providerCustomerId || null;
     view.cashApp.providerGrantId = creator.cashApp?.providerGrantId || null;
+    view.bankPayout.recipientId = creator.bankPayout?.recipientId || null;
+    view.bankPayout.payoutMethodId = creator.bankPayout?.payoutMethodId || null;
   }
 
   return view;
@@ -1203,15 +1306,379 @@ function uniqueCode(base) {
   return `${base}-${index}`;
 }
 
-function payoutAutomationConfigured() {
+function stripeGlobalPayoutsConfigured() {
   return Boolean(
-    process.env.CREATOR_PAYOUT_PROVIDER_URL &&
-    process.env.CREATOR_PAYOUT_PROVIDER_TOKEN
+    String(process.env.STRIPE_SECRET_KEY || "").trim() &&
+    STRIPE_FINANCIAL_ACCOUNT_ID
   );
 }
 
+function payoutAutomationConfigured() {
+  return (
+    stripeGlobalPayoutsConfigured() ||
+    Boolean(
+      process.env.CREATOR_PAYOUT_PROVIDER_URL &&
+      process.env.CREATOR_PAYOUT_PROVIDER_TOKEN
+    )
+  );
+}
+
+async function stripeApiRequest(
+  endpoint,
+  {
+    method = "GET",
+    body = null,
+    stripeContext = null,
+    idempotencyKey = null,
+  } = {}
+) {
+  const secret = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  if (!secret) {
+    throw new Error("Stripe bank payouts are not configured on GigProfit yet");
+  }
+
+  const headers = {
+    Authorization: `Bearer ${secret}`,
+    "Stripe-Version": STRIPE_API_VERSION,
+  };
+
+  if (stripeContext) {
+    headers["Stripe-Context"] = stripeContext;
+  }
+  if (idempotencyKey) {
+    headers["Idempotency-Key"] = idempotencyKey;
+  }
+  if (body !== null) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const response = await fetch(`https://api.stripe.com${endpoint}`, {
+    method,
+    headers,
+    body: body === null ? undefined : JSON.stringify(body),
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      data?.error?.message ||
+      data?.error ||
+      data?.message ||
+      `Stripe HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.stripe = data;
+    throw error;
+  }
+
+  return data;
+}
+
+function stripePayoutStatus(rawValue) {
+  const raw = String(rawValue || "").toLowerCase();
+
+  if (
+    [
+      "posted",
+      "paid",
+      "completed",
+      "succeeded",
+      "delivered",
+    ].includes(raw)
+  ) {
+    return "paid";
+  }
+
+  if (
+    [
+      "failed",
+      "canceled",
+      "cancelled",
+      "returned",
+      "rejected",
+      "declined",
+    ].includes(raw)
+  ) {
+    return "failed";
+  }
+
+  return "processing";
+}
+
+async function createStripeRecipientOnboarding(creator) {
+  if (!stripeGlobalPayoutsConfigured()) {
+    throw new Error(
+      "Stripe bank payouts are not fully configured on GigProfit yet"
+    );
+  }
+
+  ensureCreatorShape(creator);
+
+  if (!creator.bankPayout.recipientId) {
+    const account = await stripeApiRequest("/v2/core/accounts", {
+      method: "POST",
+      idempotencyKey: `creator-recipient-${creator.code}`,
+      body: {
+        contact_email: creator.email,
+        display_name: creator.name,
+        identity: {
+          country: "us",
+          entity_type: "individual",
+        },
+        configuration: {
+          recipient: {
+            capabilities: {
+              bank_accounts: {
+                local: {
+                  requested: true,
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!account?.id) {
+      throw new Error("Stripe did not return a recipient ID");
+    }
+
+    creator.bankPayout.recipientId = account.id;
+  }
+
+  const firstOnboarding = !creator.bankPayout.onboardingStartedAt;
+  const useCase = firstOnboarding
+    ? {
+        type: "account_onboarding",
+        account_onboarding: {
+          configurations: ["recipient"],
+          return_url: `${CREATOR_PORTAL_URL}?bank=connected`,
+          refresh_url: `${CREATOR_PORTAL_URL}?bank=refresh`,
+        },
+      }
+    : {
+        type: "account_update",
+        account_update: {
+          configurations: ["recipient"],
+          return_url: `${CREATOR_PORTAL_URL}?bank=connected`,
+          refresh_url: `${CREATOR_PORTAL_URL}?bank=refresh`,
+        },
+      };
+
+  const link = await stripeApiRequest("/v2/core/account_links", {
+    method: "POST",
+    idempotencyKey: `creator-bank-link-${creator.code}-${Date.now()}`,
+    body: {
+      account: creator.bankPayout.recipientId,
+      use_case: useCase,
+    },
+  });
+
+  if (!link?.url) {
+    throw new Error("Stripe did not return a bank onboarding link");
+  }
+
+  creator.bankPayout.status = "onboarding";
+  creator.bankPayout.onboardingStartedAt =
+    creator.bankPayout.onboardingStartedAt || nowISO();
+  creator.bankPayout.updatedAt = nowISO();
+
+  return {
+    url: link.url,
+    expiresAt: link.expires_at || null,
+  };
+}
+
+async function refreshStripeBankPayoutStatus(creator) {
+  ensureCreatorShape(creator);
+
+  if (!creator.bankPayout.recipientId || !stripeGlobalPayoutsConfigured()) {
+    return creator.bankPayout;
+  }
+
+  let payoutMethods;
+  try {
+    payoutMethods = await stripeApiRequest(
+      "/v2/money_management/payout_methods?limit=100",
+      {
+        stripeContext: creator.bankPayout.recipientId,
+      }
+    );
+  } catch (error) {
+    creator.bankPayout.status = creator.bankPayout.connected
+      ? "connected"
+      : "onboarding";
+    creator.bankPayout.updatedAt = nowISO();
+    throw error;
+  }
+
+  const methods = Array.isArray(payoutMethods?.data)
+    ? payoutMethods.data
+    : [];
+  const bankMethod =
+    methods.find(
+      (item) =>
+        item?.type === "bank_account" &&
+        item?.restricted !== true &&
+        item?.bank_account?.archived !== true
+    ) || null;
+
+  if (bankMethod) {
+    creator.bankPayout.payoutMethodId = bankMethod.id;
+    creator.bankPayout.connected = true;
+    creator.bankPayout.status = "connected";
+    creator.bankPayout.bankName =
+      bankMethod.bank_account?.bank_name ||
+      creator.bankPayout.bankName ||
+      "Bank account";
+    creator.bankPayout.last4 =
+      bankMethod.bank_account?.last4 ||
+      creator.bankPayout.last4 ||
+      null;
+  } else {
+    creator.bankPayout.connected = false;
+    creator.bankPayout.status = "onboarding";
+    creator.bankPayout.payoutMethodId = null;
+  }
+
+  creator.bankPayout.updatedAt = nowISO();
+  return creator.bankPayout;
+}
+
+async function sendStripeBankPayout(payout) {
+  if (!stripeGlobalPayoutsConfigured()) {
+    throw new Error(
+      "Stripe bank payouts are not fully configured on GigProfit yet"
+    );
+  }
+
+  const creator = store.creators[payout.creatorCode];
+  if (!creator) {
+    throw new Error("Creator not found");
+  }
+
+  await refreshStripeBankPayoutStatus(creator);
+  if (
+    !creator.bankPayout.connected ||
+    !creator.bankPayout.recipientId ||
+    !creator.bankPayout.payoutMethodId
+  ) {
+    throw new Error(
+      "Creator bank account is not ready to receive Stripe payouts"
+    );
+  }
+
+  const amountCents = Math.round(Number(payout.amount) * 100);
+  const data = await stripeApiRequest(
+    "/v2/money_management/outbound_payments",
+    {
+      method: "POST",
+      idempotencyKey: payout.id,
+      body: {
+        from: {
+          financial_account: STRIPE_FINANCIAL_ACCOUNT_ID,
+          currency: "usd",
+        },
+        to: {
+          recipient: creator.bankPayout.recipientId,
+          payout_method: creator.bankPayout.payoutMethodId,
+          currency: "usd",
+        },
+        amount: {
+          value: amountCents,
+          currency: "usd",
+        },
+        description: `GigProfit creator payout - ${creator.name}`.slice(0, 150),
+      },
+    }
+  );
+
+  return {
+    mode: "automated",
+    status: stripePayoutStatus(data?.status),
+    provider: "stripe_global_payouts",
+    providerPayoutId: data?.id || null,
+    providerStatus: String(data?.status || "processing").toUpperCase(),
+    expectedArrivalDate:
+      data?.expected_arrival_date ||
+      data?.expectedArrivalDate ||
+      null,
+    raw: data,
+  };
+}
+
+async function syncStripePayout(payout) {
+  if (
+    payout?.provider !== "stripe_global_payouts" ||
+    !payout?.providerPayoutId ||
+    !stripeGlobalPayoutsConfigured() ||
+    payout.status === "paid"
+  ) {
+    return false;
+  }
+
+  const data = await stripeApiRequest(
+    `/v2/money_management/outbound_payments/${encodeURIComponent(
+      payout.providerPayoutId
+    )}`
+  );
+
+  const nextStatus = stripePayoutStatus(data?.status);
+  payout.providerStatus = String(data?.status || "").toUpperCase();
+  payout.expectedArrivalDate =
+    data?.expected_arrival_date ||
+    data?.expectedArrivalDate ||
+    payout.expectedArrivalDate ||
+    null;
+
+  if (nextStatus === "paid") {
+    finalizePaidPayout(payout);
+    await notifyPayoutOnce(payout, "paid");
+  } else if (nextStatus === "failed") {
+    payout.status = "failed";
+    payout.failureReason =
+      data?.failure_reason?.message ||
+      data?.failure_reason ||
+      "Stripe bank payout failed or was returned";
+  } else {
+    payout.status = "processing";
+  }
+
+  payout.updatedAt = nowISO();
+  return true;
+}
+
+async function syncProcessingStripePayoutsForCreator(code) {
+  const pending = creatorPayouts(code).filter(
+    (payout) =>
+      payout.provider === "stripe_global_payouts" &&
+      ["approved", "processing"].includes(payout.status)
+  );
+
+  let changed = false;
+  for (const payout of pending.slice(0, 10)) {
+    try {
+      changed = (await syncStripePayout(payout)) || changed;
+    } catch (error) {
+      console.error("STRIPE PAYOUT STATUS SYNC ERROR:", error);
+    }
+  }
+
+  if (changed) {
+    await persist();
+  }
+}
+
 async function sendPayoutToProvider(payout) {
-  if (!payoutAutomationConfigured()) {
+  if (payout.method === "bank_account") {
+    return sendStripeBankPayout(payout);
+  }
+
+  if (
+    !process.env.CREATOR_PAYOUT_PROVIDER_URL ||
+    !process.env.CREATOR_PAYOUT_PROVIDER_TOKEN
+  ) {
     return {
       mode: "manual",
       status: "approved",
@@ -1221,7 +1688,7 @@ async function sendPayoutToProvider(payout) {
   const response = await fetch(process.env.CREATOR_PAYOUT_PROVIDER_URL, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${process.env.CREATOR_PAYOUT_PROVIDER_TOKEN}`,
+      Authorization: `Bearer ${process.env.CREATOR_PAYOUT_PROVIDER_TOKEN}`,
       "Content-Type": "application/json",
       "Idempotency-Key": payout.id,
     },
@@ -1232,8 +1699,8 @@ async function sendPayoutToProvider(payout) {
       amount: moneyNumber(payout.amount),
       amountCents: Math.round(Number(payout.amount) * 100),
       currency: "USD",
-      method: "cash_app",
-      cashtag: payout.cashtag,
+      method: payout.method || "cash_app",
+      cashtag: payout.cashtag || null,
       senderCashtag: OWNER_CASHAPP_CASHTAG,
       idempotencyKey: payout.id,
       purpose: "creator_services",
@@ -1243,7 +1710,10 @@ async function sendPayoutToProvider(payout) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const message = data?.error || data?.message || `Payout provider HTTP ${response.status}`;
+    const message =
+      data?.error ||
+      data?.message ||
+      `Payout provider HTTP ${response.status}`;
     throw new Error(message);
   }
 
@@ -1271,6 +1741,10 @@ async function sendPayoutToProvider(payout) {
       data?.payout?.id ||
       null,
     providerStatus: rawStatus,
+    expectedArrivalDate:
+      data?.expectedArrivalDate ||
+      data?.expected_arrival_date ||
+      null,
     raw: data,
   };
 }
@@ -1291,8 +1765,15 @@ function finalizePaidPayout(payout) {
   creator.updatedAt = nowISO();
 }
 
-export function createReferralRouter() {
+export function createReferralRouter({ requireFirebaseAuth } = {}) {
   const router = express.Router();
+  const requireReferralAccountAuth =
+    typeof requireFirebaseAuth === "function"
+      ? requireFirebaseAuth
+      : (_req, res) =>
+          res.status(503).json({
+            error: "Account attribution authentication is unavailable",
+          });
 
   router.get("/health", async (_req, res) => {
     await ensureLoaded();
@@ -1300,10 +1781,11 @@ export function createReferralRouter() {
     return res.json({
       ok: true,
       service: "gigprofit-referrals",
-      version: 2,
+      version: 3,
       creators: Object.keys(store.creators).length,
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
       creatorEmailConfigured: creatorEmailConfigured(),
       reelProgramPolicy: {
         minimumLifetimePaid: REEL_NEXT_MIN_LIFETIME_PAID,
@@ -1358,6 +1840,66 @@ export function createReferralRouter() {
     });
   });
 
+  router.post(
+    "/account-created/:code",
+    requireReferralAccountAuth,
+    async (req, res) => {
+      await ensureLoaded();
+
+      const code = slugify(req.params.code);
+      const creator = store.creators[code];
+
+      if (!creator || creator.status !== "active") {
+        return res.status(404).json({ error: "Referral creator not found" });
+      }
+
+      const uid = String(req.auth?.uid || "").trim();
+      if (!uid) {
+        return res.status(401).json({ error: "Authenticated account required" });
+      }
+
+      ensureCreatorShape(creator);
+      store.accountAttributions ||= {};
+
+      const attributionKey = hashSecret(
+        `gigprofit-account-attribution:${uid}`
+      );
+      const existing = store.accountAttributions[attributionKey];
+
+      if (existing) {
+        return res.json({
+          ok: true,
+          counted: false,
+          alreadyCounted: true,
+          creatorCode: existing.creatorCode,
+          sameCreator: existing.creatorCode === code,
+        });
+      }
+
+      store.accountAttributions[attributionKey] = {
+        creatorCode: code,
+        createdAt: nowISO(),
+        emailHash: req.auth?.email
+          ? hashSecret(
+              `gigprofit-account-email:${normalizeEmail(req.auth.email)}`
+            )
+          : null,
+      };
+
+      creator.metrics.accountsCreated =
+        Number(creator.metrics.accountsCreated || 0) + 1;
+      creator.updatedAt = nowISO();
+      await persist();
+
+      return res.status(201).json({
+        ok: true,
+        counted: true,
+        creatorCode: code,
+        accountsCreated: creator.metrics.accountsCreated,
+      });
+    }
+  );
+
   router.post("/creator/login", async (req, res) => {
     await ensureLoaded();
 
@@ -1394,6 +1936,8 @@ export function createReferralRouter() {
     if (!creatorAuthorized(req, creator)) {
       return res.status(401).json({ error: "Invalid creator key" });
     }
+
+    await syncProcessingStripePayoutsForCreator(code);
 
     return res.json({
       ok: true,
@@ -1593,6 +2137,90 @@ export function createReferralRouter() {
     });
   });
 
+  router.post("/creator/:code/bank/connect", async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+
+    if (!creator || creator.status !== "active") {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    if (!creatorAuthorized(req, creator)) {
+      return res.status(401).json({ error: "Invalid creator key" });
+    }
+
+    if (!stripeGlobalPayoutsConfigured()) {
+      return res.status(503).json({
+        error: "Bank payouts are being connected to Stripe and are not available yet",
+        code: "STRIPE_BANK_PAYOUTS_NOT_CONFIGURED",
+      });
+    }
+
+    const hasActivePayout = creatorPayouts(code).some((payout) =>
+      ["requested", "approved", "processing"].includes(payout.status)
+    );
+    if (hasActivePayout) {
+      return res.status(409).json({
+        error: "Bank payout details cannot be changed while a payout is pending",
+      });
+    }
+
+    try {
+      const onboarding = await createStripeRecipientOnboarding(creator);
+      creator.updatedAt = nowISO();
+      await persist();
+
+      return res.json({
+        ok: true,
+        url: onboarding.url,
+        expiresAt: onboarding.expiresAt,
+        creator: creatorView(creator, false),
+      });
+    } catch (error) {
+      console.error("STRIPE BANK ONBOARDING ERROR:", error);
+      return res.status(502).json({
+        error: "Unable to start secure bank connection",
+        details: error?.message || String(error),
+      });
+    }
+  });
+
+  router.get("/creator/:code/bank/status", async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+
+    if (!creator || creator.status !== "active") {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    if (!creatorAuthorized(req, creator)) {
+      return res.status(401).json({ error: "Invalid creator key" });
+    }
+
+    try {
+      await refreshStripeBankPayoutStatus(creator);
+      creator.updatedAt = nowISO();
+      await persist();
+
+      return res.json({
+        ok: true,
+        bankPayout: creatorView(creator, false).bankPayout,
+        creator: creatorView(creator, false),
+      });
+    } catch (error) {
+      console.error("STRIPE BANK STATUS ERROR:", error);
+      return res.status(502).json({
+        error: "Unable to refresh bank connection status",
+        details: error?.message || String(error),
+        creator: creatorView(creator, false),
+      });
+    }
+  });
+
   router.put("/creator/:code/cashapp", async (req, res) => {
     await ensureLoaded();
 
@@ -1662,9 +2290,9 @@ export function createReferralRouter() {
 
     ensureCreatorShape(creator);
 
-    if (!creator.cashApp?.cashtag) {
+    if (!creator.bankPayout?.connected) {
       return res.status(400).json({
-        error: "Add a Cash App $Cashtag before requesting a payout",
+        error: "Connect a verified bank payout destination before requesting Cash Out",
       });
     }
 
@@ -1696,12 +2324,17 @@ export function createReferralRouter() {
       creatorCode: code,
       creatorName: creator.name,
       amount,
-      method: "cash_app",
-      cashtag: creator.cashApp.cashtag,
+      method: "bank_account",
+      cashtag: null,
+      bankName: creator.bankPayout.bankName || "Bank account",
+      bankLast4: creator.bankPayout.last4 || null,
       status: "requested",
       provider: null,
       providerPayoutId: null,
       providerStatus: null,
+      expectedArrivalDate: null,
+      estimatedArrival:
+        `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
       failureReason: null,
       notifications: {
         ownerRequestedAt: null,
@@ -1740,6 +2373,10 @@ export function createReferralRouter() {
   router.get("/admin/creators", requireAdmin, async (_req, res) => {
     await ensureLoaded();
 
+    for (const creator of Object.values(store.creators)) {
+      await syncProcessingStripePayoutsForCreator(creator.code);
+    }
+
     const creators = Object.values(store.creators)
       .map((creator) => creatorView(creator, true))
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -1748,6 +2385,7 @@ export function createReferralRouter() {
       ok: true,
       creators,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
       creatorEmailConfigured: creatorEmailConfigured(),
       ownerCashAppCashtag: OWNER_CASHAPP_CASHTAG,
       contactEmail: CONTACT_EMAIL,
@@ -1757,6 +2395,10 @@ export function createReferralRouter() {
   router.get("/admin/payouts", requireAdmin, async (_req, res) => {
     await ensureLoaded();
 
+    for (const creator of Object.values(store.creators)) {
+      await syncProcessingStripePayoutsForCreator(creator.code);
+    }
+
     const payouts = Object.values(store.payouts)
       .map(payoutView)
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -1764,6 +2406,7 @@ export function createReferralRouter() {
     return res.json({
       ok: true,
       payoutAutomationConfigured: payoutAutomationConfigured(),
+      stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
       ownerCashAppCashtag: OWNER_CASHAPP_CASHTAG,
       payouts,
     });
@@ -1777,6 +2420,18 @@ export function createReferralRouter() {
 
     if (!name || !email || !email.includes("@")) {
       return res.status(400).json({ error: "Name and creator email are required" });
+    }
+
+    const existingCreator = Object.values(store.creators).find(
+      (item) => normalizeEmail(item?.email) === email
+    );
+    if (existingCreator) {
+      ensureCreatorShape(existingCreator);
+      return res.status(409).json({
+        error: "Creator already exists with this email",
+        code: "CREATOR_EMAIL_EXISTS",
+        creator: creatorView(existingCreator, true),
+      });
     }
 
     const requestedCode = slugify(req.body?.code || name);
@@ -1803,9 +2458,13 @@ export function createReferralRouter() {
         nextRequest: null,
         activeOpportunity: null,
       },
-      downloadBonus: Math.max(
+      accountBonus: Math.max(
         0,
-        moneyNumber(req.body?.downloadBonus ?? DEFAULT_DOWNLOAD_BONUS)
+        moneyNumber(
+          req.body?.accountBonus ??
+          req.body?.downloadBonus ??
+          DEFAULT_ACCOUNT_BONUS
+        )
       ),
       accessKeyHash: hashSecret(accessKey),
       notes: String(req.body?.notes || "").trim(),
@@ -1817,10 +2476,22 @@ export function createReferralRouter() {
         providerGrantId: null,
         updatedAt: null,
       },
+      bankPayout: {
+        provider: "stripe_global_payouts",
+        recipientId: null,
+        payoutMethodId: null,
+        connected: false,
+        status: "not_connected",
+        bankName: null,
+        last4: null,
+        updatedAt: null,
+        onboardingStartedAt: null,
+      },
       metrics: {
         clicks: 0,
         uniqueClicks: 0,
         installs: 0,
+        accountsCreated: 0,
         subscriptions: 0,
         revenue: 0,
         paidEarnings: 0,
@@ -1846,6 +2517,7 @@ export function createReferralRouter() {
       creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
       creator.invitation.lastMessageId = invitationEmail.messageId || null;
       creator.invitation.lastError = null;
+      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
     } else {
       creator.invitation.delivery = invitationEmail.configured ? "failed" : "not_configured";
       creator.invitation.lastError = invitationEmail.error || null;
@@ -1883,6 +2555,18 @@ export function createReferralRouter() {
       if (!email.includes("@")) {
         return res.status(400).json({ error: "Invalid email" });
       }
+      const duplicate = Object.values(store.creators).find(
+        (item) =>
+          item !== creator &&
+          normalizeEmail(item?.email) === email
+      );
+      if (duplicate) {
+        return res.status(409).json({
+          error: "Another creator already uses this email",
+          code: "CREATOR_EMAIL_EXISTS",
+          creator: creatorView(duplicate, true),
+        });
+      }
       creator.email = email;
     }
 
@@ -1902,8 +2586,15 @@ export function createReferralRouter() {
       creator.reelFee = Math.max(0, moneyNumber(req.body.reelFee));
     }
 
-    if (req.body?.downloadBonus !== undefined) {
-      creator.downloadBonus = Math.max(0, moneyNumber(req.body.downloadBonus));
+    if (
+      req.body?.accountBonus !== undefined ||
+      req.body?.downloadBonus !== undefined
+    ) {
+      creator.accountBonus = Math.max(
+        0,
+        moneyNumber(req.body?.accountBonus ?? req.body?.downloadBonus)
+      );
+      creator.downloadBonus = creator.accountBonus;
     }
 
     if (req.body?.reelCompleted !== undefined) {
@@ -2301,7 +2992,7 @@ export function createReferralRouter() {
 
       ensureCreatorShape(creator);
 
-      for (const field of ["installs", "subscriptions", "revenue"]) {
+      for (const field of ["installs", "accountsCreated", "subscriptions", "revenue"]) {
         if (req.body?.[field] !== undefined) {
           const value = Number(req.body[field]);
           if (!Number.isFinite(value) || value < 0) {
@@ -2367,6 +3058,7 @@ export function createReferralRouter() {
       creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
       creator.invitation.lastMessageId = invitationEmail.messageId || null;
       creator.invitation.lastError = null;
+      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
       creator.updatedAt = nowISO();
       await persist();
 
@@ -2432,6 +3124,10 @@ export function createReferralRouter() {
       payout.provider = providerResult.provider || providerResult.mode;
       payout.providerPayoutId = providerResult.providerPayoutId || null;
       payout.providerStatus = providerResult.providerStatus || null;
+      payout.expectedArrivalDate =
+        providerResult.expectedArrivalDate ||
+        payout.expectedArrivalDate ||
+        null;
 
       if (providerResult.status === "paid") {
         finalizePaidPayout(payout);
@@ -2521,7 +3217,7 @@ export function createReferralRouter() {
     }
 
     finalizePaidPayout(payout);
-    payout.provider = payout.provider || "manual-cash-app";
+    payout.provider = payout.provider || "manual";
     payout.providerStatus = "PAID_CONFIRMED_BY_OWNER";
     payout.updatedAt = nowISO();
     await persist();
