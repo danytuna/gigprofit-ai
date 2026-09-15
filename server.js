@@ -89,7 +89,6 @@ applyHttpSecurity(app, {
   nodeEnv: NODE_ENV,
 });
 app.use(express.json({ limit: "3mb" }));
-app.use("/referrals", createReferralRouter());
 
 const PORT = process.env.PORT || 8080;
 
@@ -121,6 +120,10 @@ const firebaseAdminServices = getFirebaseAdminServices({
 });
 const requireFirebaseAuth = createRequireFirebaseAuth(
   firebaseAdminServices.auth
+);
+app.use(
+  "/referrals",
+  createReferralRouter({ requireFirebaseAuth })
 );
 const requireProSubscription = createCanonicalPlanAuthorizer({
   firestore: firebaseAdminServices.firestore,
