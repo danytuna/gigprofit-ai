@@ -1873,6 +1873,14 @@ function finalizePaidPayout(payout) {
 
 export function createReferralRouter({ requireFirebaseAuth } = {}) {
   const router = express.Router();
+
+  // Load and sanitize persisted creator data at process start, not only on the
+  // first referral request. This also removes historical duplicate-email
+  // creator records and creates a backup before rewriting the store.
+  void ensureLoaded().catch((error) => {
+    console.error("REFERRAL STARTUP LOAD ERROR:", error);
+  });
+
   const requireReferralAccountAuth =
     typeof requireFirebaseAuth === "function"
       ? requireFirebaseAuth
