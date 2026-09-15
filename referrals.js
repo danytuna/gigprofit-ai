@@ -1679,6 +1679,178 @@ async function retrieveStripeFundingAccount() {
   );
 }
 
+async function retrieveStripeInboundTransfer(id) {
+  if (!id) return null;
+  return stripeApiRequest(
+    `/v2/money_management/inbound_transfers/${encodeURIComponent(id)}`
+  );
+}
+
+async function createStripeInboundTransfer(amountCents, intentId) {
+  if (!stripeAutofundConfigured()) {
+    throw new Error(
+      "Stripe automatic bank funding is not fully configured"
+    );
+  }
+
+  const amount = Math.max(100, Math.floor(Number(amountCents || 0)));
+  if (amount > STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS) {
+    throw new Error(
+      `Automatic bank funding is capped at ${(
+        STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS / 100
+      ).toFixed(2)} per transfer`
+    );
+  }
+
+  const endpoint = "/v2/money_management/inbound_transfers";
+  const description = "GigProfit creator payout funding".slice(0, 100);
+
+  try {
+    return await stripeApiRequest(endpoint, {
+      method: "POST",
+      idempotencyKey: intentId,
+      body: {
+        from: STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID,
+        to: {
+          financial_account: STRIPE_FINANCIAL_ACCOUNT_ID,
+        },
+        amount: {
+          value: amount,
+          currency: "usd",
+        },
+        description,
+      },
+    });
+  } catch (error) {
+    const code = String(
+      error?.stripe?.error?.code ||
+      error?.stripe?.code ||
+      ""
+    ).toLowerCase();
+    const message = String(error?.message || "").toLowerCase();
+    const schemaError =
+      Number(error?.status) === 400 &&
+      (
+        code.includes("invalid_argument") ||
+        message.includes("unknown") ||
+        message.includes("invalid") ||
+        message.includes("required")
+      );
+
+    if (!schemaError) throw error;
+
+    return stripeApiRequest(endpoint, {
+      method: "POST",
+      idempotencyKey: intentId,
+      body: {
+        from: {
+          payment_method: STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID,
+        },
+        to: {
+          financial_account: STRIPE_FINANCIAL_ACCOUNT_ID,
+          balance_type: "storage",
+        },
+        money_movement_amounts: {
+          destination: {
+            value: amount,
+            currency: "usd",
+          },
+        },
+        description,
+      },
+    });
+  }
+}
+
+async function startStripeAutofund(amountCents, reason = "creator_payout") {
+  if (!stripeAutofundConfigured()) {
+    throw new Error(
+      "Automatic Stripe bank funding is disabled or missing a funding source"
+    );
+  }
+
+  const funding = store.funding || (store.funding = {});
+  if (funding.activeInboundTransferId) {
+    return {
+      alreadyActive: true,
+      id: funding.activeInboundTransferId,
+      amountCents: Number(funding.activeAmountCents || 0),
+      status: funding.lastStatus || "pending",
+    };
+  }
+
+  const amount = Math.max(100, Math.floor(Number(amountCents || 0)));
+  if (amount > STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS) {
+    throw new Error(
+      `Required automatic bank funding (${(amount / 100).toFixed(2)}) exceeds the configured safety cap`
+    );
+  }
+
+  const intentId =
+    funding.activeIntentId ||
+    `gigprofit-autofund-${crypto.randomUUID()}`;
+
+  funding.activeIntentId = intentId;
+  funding.activeAmountCents = amount;
+  funding.startedAt = funding.startedAt || nowISO();
+  funding.lastStatus = "starting";
+  funding.lastError = null;
+  funding.lastErrorAt = null;
+  await persist();
+
+  try {
+    const transfer = await createStripeInboundTransfer(amount, intentId);
+    if (!transfer?.id) {
+      throw new Error("Stripe did not return an InboundTransfer ID");
+    }
+
+    funding.activeInboundTransferId = transfer.id;
+    funding.lastStatus = stripeInboundTransferState(transfer);
+    funding.lastError = null;
+    funding.lastErrorAt = null;
+    funding.reason = reason;
+    await persist();
+
+    return {
+      alreadyActive: false,
+      id: transfer.id,
+      amountCents: amount,
+      status: funding.lastStatus,
+    };
+  } catch (error) {
+    funding.lastStatus = "error";
+    funding.lastError = error?.message || String(error);
+    funding.lastErrorAt = nowISO();
+    await persist();
+    throw error;
+  }
+}
+
+function clearCompletedAutofund(status = "completed") {
+  const funding = store.funding || (store.funding = {});
+  funding.lastStatus = status;
+  funding.lastCompletedAt = nowISO();
+  funding.activeInboundTransferId = null;
+  funding.activeIntentId = null;
+  funding.activeAmountCents = 0;
+  funding.startedAt = null;
+}
+
+async function maybeStartBufferFunding(currentAvailableCents) {
+  if (!stripeAutofundConfigured()) return null;
+
+  const available = Math.max(0, Number(currentAvailableCents || 0));
+  if (available >= STRIPE_AUTOFUND_MIN_BALANCE_CENTS) return null;
+  if (store.funding?.activeInboundTransferId) return null;
+
+  const amount = Math.max(
+    100,
+    STRIPE_AUTOFUND_TARGET_BALANCE_CENTS - available
+  );
+
+  return startStripeAutofund(amount, "buffer_replenishment");
+}
+
 function stripeAvailableUsdCents(financialAccount) {
   const value =
     financialAccount?.balance?.available?.usd?.value ??
