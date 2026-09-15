@@ -36,6 +36,14 @@ const STRIPE_API_VERSION =
   "2026-08-26.preview";
 const STRIPE_FINANCIAL_ACCOUNT_ID =
   String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
+const STRIPE_PAYOUT_SYNC_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.STRIPE_PAYOUT_SYNC_INTERVAL_MS || 300_000)
+);
+const STRIPE_RETURN_MONITOR_DAYS = Math.max(
+  3,
+  Math.floor(Number(process.env.STRIPE_RETURN_MONITOR_DAYS || 14))
+);
 const PAYOUT_ESTIMATE_MIN_DAYS = Math.max(
   1,
   Math.floor(Number(process.env.CREATOR_PAYOUT_ESTIMATE_MIN_DAYS || 1))
@@ -849,6 +857,10 @@ function ensureCreatorShape(creator) {
     (creator.bankPayout.connected ? "connected" : "not_connected");
   creator.bankPayout.bankName = creator.bankPayout.bankName || null;
   creator.bankPayout.last4 = creator.bankPayout.last4 || null;
+  creator.bankPayout.capabilityStatus =
+    creator.bankPayout.capabilityStatus || null;
+  creator.bankPayout.requirementsPending =
+    Math.max(0, Number(creator.bankPayout.requirementsPending || 0));
   creator.bankPayout.updatedAt = creator.bankPayout.updatedAt || null;
   creator.bankPayout.onboardingStartedAt =
     creator.bankPayout.onboardingStartedAt || null;
@@ -1339,6 +1351,10 @@ function creatorView(creator, includePrivate = false) {
       provider: creator.bankPayout?.provider || "stripe_global_payouts",
       bankName: creator.bankPayout?.bankName || null,
       last4: creator.bankPayout?.last4 || null,
+      capabilityStatus: creator.bankPayout?.capabilityStatus || null,
+      requirementsPending: Number(
+        creator.bankPayout?.requirementsPending || 0
+      ),
       updatedAt: creator.bankPayout?.updatedAt || null,
     },
     cashApp: {
@@ -1412,9 +1428,21 @@ function uniqueCode(base) {
   return `${base}-${index}`;
 }
 
+function stripeGlobalPayoutsKey() {
+  return String(
+    process.env.STRIPE_GLOBAL_PAYOUTS_KEY ||
+    process.env.STRIPE_SECRET_KEY ||
+    ""
+  ).trim();
+}
+
+function stripeRestrictedKeyConfigured() {
+  return stripeGlobalPayoutsKey().startsWith("rk_");
+}
+
 function stripeGlobalPayoutsConfigured() {
   return Boolean(
-    String(process.env.STRIPE_SECRET_KEY || "").trim() &&
+    stripeRestrictedKeyConfigured() &&
     STRIPE_FINANCIAL_ACCOUNT_ID
   );
 }
@@ -1438,9 +1466,14 @@ async function stripeApiRequest(
     idempotencyKey = null,
   } = {}
 ) {
-  const secret = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const secret = stripeGlobalPayoutsKey();
   if (!secret) {
     throw new Error("Stripe bank payouts are not configured on GigProfit yet");
+  }
+  if (!secret.startsWith("rk_")) {
+    throw new Error(
+      "Stripe Global Payouts requires a live Restricted API Key (rk_live_...), not a standard secret key"
+    );
   }
 
   const headers = {
@@ -1510,6 +1543,58 @@ function stripePayoutStatus(rawValue) {
   }
 
   return "processing";
+}
+
+function stripeRecipientCapabilityStatus(account) {
+  const local =
+    account?.configuration?.recipient?.capabilities?.bank_accounts?.local;
+  if (typeof local === "string") return local.toLowerCase();
+  return String(local?.status || "").toLowerCase() || null;
+}
+
+function stripeRecipientRequirementsPending(account) {
+  const entries = Array.isArray(account?.requirements?.entries)
+    ? account.requirements.entries
+    : [];
+  return entries.filter((entry) =>
+    Array.isArray(entry?.restricts_capabilities)
+      ? entry.restricts_capabilities.length > 0
+      : Boolean(entry?.restricts_capabilities)
+  ).length;
+}
+
+async function retrieveStripeRecipientAccount(recipientId) {
+  if (!recipientId) return null;
+
+  const include = [
+    "configuration.recipient",
+    "requirements",
+  ]
+    .map(
+      (item, index) =>
+        `include[${index}]=${encodeURIComponent(item)}`
+    )
+    .join("&");
+
+  return stripeApiRequest(
+    `/v2/core/accounts/${encodeURIComponent(recipientId)}?${include}`
+  );
+}
+
+async function retrieveStripeFundingAccount() {
+  if (!STRIPE_FINANCIAL_ACCOUNT_ID) return null;
+  return stripeApiRequest(
+    `/v2/money_management/financial_accounts/${encodeURIComponent(
+      STRIPE_FINANCIAL_ACCOUNT_ID
+    )}`
+  );
+}
+
+function stripeAvailableUsdCents(financialAccount) {
+  const value =
+    financialAccount?.balance?.available?.usd?.value ??
+    financialAccount?.balance?.available?.USD?.value;
+  return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
 async function createStripeRecipientOnboarding(creator) {
@@ -1603,14 +1688,19 @@ async function refreshStripeBankPayoutStatus(creator) {
     return creator.bankPayout;
   }
 
+  let account;
   let payoutMethods;
+
   try {
-    payoutMethods = await stripeApiRequest(
-      "/v2/money_management/payout_methods?limit=100",
-      {
-        stripeContext: creator.bankPayout.recipientId,
-      }
-    );
+    [account, payoutMethods] = await Promise.all([
+      retrieveStripeRecipientAccount(creator.bankPayout.recipientId),
+      stripeApiRequest(
+        "/v2/money_management/payout_methods?limit=100",
+        {
+          stripeContext: creator.bankPayout.recipientId,
+        }
+      ),
+    ]);
   } catch (error) {
     creator.bankPayout.status = creator.bankPayout.connected
       ? "connected"
@@ -1619,6 +1709,8 @@ async function refreshStripeBankPayoutStatus(creator) {
     throw error;
   }
 
+  const capabilityStatus = stripeRecipientCapabilityStatus(account);
+  const requirementsPending = stripeRecipientRequirementsPending(account);
   const methods = Array.isArray(payoutMethods?.data)
     ? payoutMethods.data
     : [];
@@ -1627,10 +1719,17 @@ async function refreshStripeBankPayoutStatus(creator) {
       (item) =>
         item?.type === "bank_account" &&
         item?.restricted !== true &&
-        item?.bank_account?.archived !== true
+        item?.bank_account?.archived !== true &&
+        (
+          !Array.isArray(item?.available_payout_speeds) ||
+          item.available_payout_speeds.includes("standard")
+        )
     ) || null;
 
-  if (bankMethod) {
+  creator.bankPayout.capabilityStatus = capabilityStatus;
+  creator.bankPayout.requirementsPending = requirementsPending;
+
+  if (bankMethod && capabilityStatus === "active") {
     creator.bankPayout.payoutMethodId = bankMethod.id;
     creator.bankPayout.connected = true;
     creator.bankPayout.status = "connected";
@@ -1644,8 +1743,11 @@ async function refreshStripeBankPayoutStatus(creator) {
       null;
   } else {
     creator.bankPayout.connected = false;
-    creator.bankPayout.status = "onboarding";
-    creator.bankPayout.payoutMethodId = null;
+    creator.bankPayout.status =
+      capabilityStatus === "restricted"
+        ? "restricted"
+        : "onboarding";
+    creator.bankPayout.payoutMethodId = bankMethod?.id || null;
   }
 
   creator.bankPayout.updatedAt = nowISO();
@@ -1667,15 +1769,31 @@ async function sendStripeBankPayout(payout) {
   await refreshStripeBankPayoutStatus(creator);
   if (
     !creator.bankPayout.connected ||
+    creator.bankPayout.capabilityStatus !== "active" ||
     !creator.bankPayout.recipientId ||
     !creator.bankPayout.payoutMethodId
   ) {
+    const suffix = creator.bankPayout.requirementsPending
+      ? ` (${creator.bankPayout.requirementsPending} Stripe requirement(s) still pending)`
+      : "";
     throw new Error(
-      "Creator bank account is not ready to receive Stripe payouts"
+      `Creator bank account is not fully active for Stripe payouts${suffix}`
     );
   }
 
   const amountCents = Math.round(Number(payout.amount) * 100);
+  const fundingAccount = await retrieveStripeFundingAccount();
+  const availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  if (
+    availableUsdCents !== null &&
+    availableUsdCents < amountCents
+  ) {
+    throw new Error(
+      `Insufficient Stripe Global Payouts balance. Available: ${(
+        availableUsdCents / 100
+      ).toFixed(2)}; requested: ${(amountCents / 100).toFixed(2)}`
+    );
+  }
   const data = await stripeApiRequest(
     "/v2/money_management/outbound_payments",
     {
@@ -1714,12 +1832,30 @@ async function sendStripeBankPayout(payout) {
   };
 }
 
+function rollbackPaidCreditForReturnedPayout(payout) {
+  if (!payout?.paidEarningsCredited) return;
+
+  const creator = store.creators[payout.creatorCode];
+  if (!creator) return;
+
+  ensureCreatorShape(creator);
+  creator.metrics.paidEarnings = moneyNumber(
+    Math.max(
+      0,
+      Number(creator.metrics.paidEarnings || 0) -
+        Number(payout.amount || 0)
+    )
+  );
+  creator.updatedAt = nowISO();
+  payout.paidEarningsCredited = false;
+  payout.paidEarningsReversedAt = nowISO();
+}
+
 async function syncStripePayout(payout) {
   if (
     payout?.provider !== "stripe_global_payouts" ||
     !payout?.providerPayoutId ||
-    !stripeGlobalPayoutsConfigured() ||
-    payout.status === "paid"
+    !stripeGlobalPayoutsConfigured()
   ) {
     return false;
   }
@@ -1742,11 +1878,13 @@ async function syncStripePayout(payout) {
     finalizePaidPayout(payout);
     await notifyPayoutOnce(payout, "paid");
   } else if (nextStatus === "failed") {
+    rollbackPaidCreditForReturnedPayout(payout);
     payout.status = "failed";
     payout.failureReason =
+      data?.status_details?.returned?.reason ||
       data?.failure_reason?.message ||
       data?.failure_reason ||
-      "Stripe bank payout failed or was returned";
+      "Stripe bank payout failed, was canceled, or was returned";
   } else {
     payout.status = "processing";
   }
@@ -1756,11 +1894,26 @@ async function syncStripePayout(payout) {
 }
 
 async function syncProcessingStripePayoutsForCreator(code) {
-  const pending = creatorPayouts(code).filter(
-    (payout) =>
-      payout.provider === "stripe_global_payouts" &&
-      ["approved", "processing"].includes(payout.status)
-  );
+  const cutoff =
+    Date.now() -
+    STRIPE_RETURN_MONITOR_DAYS * 24 * 60 * 60 * 1000;
+
+  const pending = creatorPayouts(code).filter((payout) => {
+    if (payout.provider !== "stripe_global_payouts") return false;
+    if (["approved", "processing"].includes(payout.status)) return true;
+
+    if (payout.status === "paid") {
+      const sentAt = Date.parse(
+        payout.paidAt ||
+        payout.updatedAt ||
+        payout.createdAt ||
+        ""
+      );
+      return Number.isFinite(sentAt) && sentAt >= cutoff;
+    }
+
+    return false;
+  });
 
   let changed = false;
   for (const payout of pending.slice(0, 10)) {
@@ -1862,13 +2015,87 @@ function finalizePaidPayout(payout) {
   if (!creator) return;
 
   ensureCreatorShape(creator);
-  creator.metrics.paidEarnings = moneyNumber(
-    Number(creator.metrics.paidEarnings || 0) + Number(payout.amount || 0)
-  );
+  if (!payout.paidEarningsCredited) {
+    creator.metrics.paidEarnings = moneyNumber(
+      Number(creator.metrics.paidEarnings || 0) + Number(payout.amount || 0)
+    );
+    payout.paidEarningsCredited = true;
+  }
 
   payout.status = "paid";
   payout.paidAt = payout.paidAt || nowISO();
   creator.updatedAt = nowISO();
+}
+
+let stripeBackgroundSyncStarted = false;
+
+function startStripeBackgroundSync() {
+  if (stripeBackgroundSyncStarted || !stripeGlobalPayoutsConfigured()) return;
+  stripeBackgroundSyncStarted = true;
+
+  const run = async () => {
+    try {
+      await ensureLoaded();
+      let changed = false;
+
+      for (const creator of Object.values(store.creators)) {
+        ensureCreatorShape(creator);
+
+        if (
+          creator.bankPayout?.recipientId &&
+          ["onboarding", "connected", "restricted"].includes(
+            creator.bankPayout?.status
+          )
+        ) {
+          try {
+            const before = JSON.stringify(creator.bankPayout);
+            await refreshStripeBankPayoutStatus(creator);
+            if (JSON.stringify(creator.bankPayout) !== before) changed = true;
+          } catch (error) {
+            console.error(
+              "STRIPE BANK BACKGROUND STATUS ERROR:",
+              creator.code,
+              error?.message || error
+            );
+          }
+        }
+
+        const beforePayouts = JSON.stringify(
+          creatorPayouts(creator.code).map((payout) => ({
+            id: payout.id,
+            status: payout.status,
+            providerStatus: payout.providerStatus,
+            expectedArrivalDate: payout.expectedArrivalDate,
+            paidEarningsCredited: payout.paidEarningsCredited,
+          }))
+        );
+
+        await syncProcessingStripePayoutsForCreator(creator.code);
+
+        const afterPayouts = JSON.stringify(
+          creatorPayouts(creator.code).map((payout) => ({
+            id: payout.id,
+            status: payout.status,
+            providerStatus: payout.providerStatus,
+            expectedArrivalDate: payout.expectedArrivalDate,
+            paidEarningsCredited: payout.paidEarningsCredited,
+          }))
+        );
+        if (beforePayouts !== afterPayouts) changed = true;
+      }
+
+      if (changed) await persist();
+    } catch (error) {
+      console.error(
+        "STRIPE CREATOR BACKGROUND SYNC ERROR:",
+        error?.message || error
+      );
+    }
+  };
+
+  const timer = setInterval(run, STRIPE_PAYOUT_SYNC_INTERVAL_MS);
+  timer.unref?.();
+  setTimeout(run, 15_000).unref?.();
 }
 
 export function createReferralRouter({ requireFirebaseAuth } = {}) {
@@ -1880,6 +2107,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
   void ensureLoaded().catch((error) => {
     console.error("REFERRAL STARTUP LOAD ERROR:", error);
   });
+  startStripeBackgroundSync();
 
   const requireReferralAccountAuth =
     typeof requireFirebaseAuth === "function"
@@ -1900,6 +2128,10 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
       stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
+      stripeRestrictedKeyConfigured: stripeRestrictedKeyConfigured(),
+      stripeBackgroundSyncEnabled: stripeGlobalPayoutsConfigured(),
+      stripePayoutSyncIntervalSeconds:
+        Math.round(STRIPE_PAYOUT_SYNC_INTERVAL_MS / 1000),
       creatorEmailConfigured: creatorEmailConfigured(),
       reelProgramPolicy: {
         minimumLifetimePaid: REEL_NEXT_MIN_LIFETIME_PAID,
@@ -2598,6 +2830,8 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         status: "not_connected",
         bankName: null,
         last4: null,
+        capabilityStatus: null,
+        requirementsPending: 0,
         updatedAt: null,
         onboardingStartedAt: null,
       },
