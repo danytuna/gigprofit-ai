@@ -2217,6 +2217,16 @@ async function syncStripePayout(payout) {
 async function syncStripeAutofundingAndFundedPayouts() {
   if (!stripeAutofundConfigured()) return false;
 
+  const hasFundingWork =
+    Boolean(store.funding?.activeInboundTransferId) ||
+    Object.values(store.payouts || {}).some(
+      (payout) =>
+        payout.method === "bank_account" &&
+        payout.status === "funding"
+    );
+
+  if (!hasFundingWork) return false;
+
   let changed = false;
   const funding = store.funding || (store.funding = {});
   let fundingAccount = await retrieveStripeFundingAccount();
