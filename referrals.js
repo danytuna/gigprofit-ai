@@ -2045,16 +2045,58 @@ async function sendStripeBankPayout(payout) {
   const amountCents = Math.round(Number(payout.amount) * 100);
   const fundingAccount = await retrieveStripeFundingAccount();
   const availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  store.funding ||= {};
+  store.funding.lastAvailableUsdCents = availableUsdCents;
+
   if (
     availableUsdCents !== null &&
     availableUsdCents < amountCents
   ) {
-    throw new Error(
-      `Insufficient Stripe Global Payouts balance. Available: ${(
-        availableUsdCents / 100
-      ).toFixed(2)}; requested: ${(amountCents / 100).toFixed(2)}`
+    if (!stripeAutofundConfigured()) {
+      throw new Error(
+        `Insufficient Stripe Global Payouts balance. Available: ${(
+          availableUsdCents / 100
+        ).toFixed(2)}; requested: ${(amountCents / 100).toFixed(2)}`
+      );
+    }
+
+    const desiredBalance = Math.max(
+      amountCents,
+      STRIPE_AUTOFUND_TARGET_BALANCE_CENTS
     );
+    const fundingAmountCents = Math.max(
+      100,
+      desiredBalance - availableUsdCents
+    );
+    const fundingResult = await startStripeAutofund(
+      fundingAmountCents,
+      `payout:${payout.id}`
+    );
+
+    payout.status = "funding";
+    payout.provider = "stripe_global_payouts";
+    payout.providerStatus = "FUNDING";
+    payout.fundingInboundTransferId = fundingResult.id || null;
+    payout.fundingAmountCents = fundingResult.amountCents || fundingAmountCents;
+    payout.fundingStartedAt = payout.fundingStartedAt || nowISO();
+    payout.fundingStatus = fundingResult.status || "pending";
+    payout.estimatedArrival =
+      "Funding bank transfer in progress; payout sends automatically when funds are available";
+    payout.updatedAt = nowISO();
+    await persist();
+
+    return {
+      mode: "automated",
+      status: "funding",
+      provider: "stripe_global_payouts",
+      providerPayoutId: null,
+      providerStatus: "FUNDING",
+      fundingInboundTransferId: payout.fundingInboundTransferId,
+      fundingAmountCents: payout.fundingAmountCents,
+      raw: fundingResult,
+    };
   }
+
   const data = await stripeApiRequest(
     "/v2/money_management/outbound_payments",
     {
@@ -2078,6 +2120,24 @@ async function sendStripeBankPayout(payout) {
       },
     }
   );
+
+  const remainingAfterSend =
+    availableUsdCents === null
+      ? null
+      : Math.max(0, availableUsdCents - amountCents);
+
+  if (
+    remainingAfterSend !== null &&
+    stripeAutofundConfigured() &&
+    remainingAfterSend < STRIPE_AUTOFUND_MIN_BALANCE_CENTS
+  ) {
+    void maybeStartBufferFunding(remainingAfterSend).catch((error) => {
+      console.error(
+        "STRIPE AUTOFUND BUFFER ERROR:",
+        error?.message || error
+      );
+    });
+  }
 
   return {
     mode: "automated",
