@@ -38,6 +38,10 @@ const STRIPE_FINANCIAL_ACCOUNT_ID =
   String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
 const STRIPE_AUTOFUND_ENABLED =
   String(process.env.STRIPE_AUTOFUND_ENABLED || "false").toLowerCase() === "true";
+const STRIPE_AUTOFUND_FULL_PAYOUT_FROM_BANK =
+  String(
+    process.env.STRIPE_AUTOFUND_FULL_PAYOUT_FROM_BANK || "false"
+  ).toLowerCase() === "true";
 const STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID =
   String(process.env.STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID || "").trim();
 const STRIPE_AUTOFUND_MIN_BALANCE_CENTS = Math.max(
@@ -2049,6 +2053,45 @@ async function sendStripeBankPayout(payout) {
   store.funding.lastAvailableUsdCents = availableUsdCents;
 
   if (
+    STRIPE_AUTOFUND_FULL_PAYOUT_FROM_BANK &&
+    !payout.fundingStartedAt
+  ) {
+    if (!stripeAutofundConfigured()) {
+      throw new Error(
+        "Automatic Stripe bank funding is not fully configured"
+      );
+    }
+
+    const fundingResult = await startStripeAutofund(
+      amountCents,
+      `payout:${payout.id}`
+    );
+
+    payout.status = "funding";
+    payout.provider = "stripe_global_payouts";
+    payout.providerStatus = "FUNDING";
+    payout.fundingInboundTransferId = fundingResult.id || null;
+    payout.fundingAmountCents = fundingResult.amountCents || amountCents;
+    payout.fundingStartedAt = nowISO();
+    payout.fundingStatus = fundingResult.status || "pending";
+    payout.estimatedArrival =
+      "Approved; funding directly from the Nova Prime bank account before the creator payout is sent.";
+    payout.updatedAt = nowISO();
+    await persist();
+
+    return {
+      mode: "automated",
+      status: "funding",
+      provider: "stripe_global_payouts",
+      providerPayoutId: null,
+      providerStatus: "FUNDING",
+      fundingInboundTransferId: payout.fundingInboundTransferId,
+      fundingAmountCents: payout.fundingAmountCents,
+      raw: fundingResult,
+    };
+  }
+
+  if (
     availableUsdCents !== null &&
     availableUsdCents < amountCents
   ) {
@@ -2261,6 +2304,9 @@ async function syncStripeAutofundingAndFundedPayouts() {
             payout.failureReason =
               `Automatic bank funding failed: ${reason}`;
             payout.fundingStatus = state;
+            payout.fundingInboundTransferId = null;
+            payout.fundingAmountCents = 0;
+            payout.fundingStartedAt = null;
             payout.updatedAt = nowISO();
           }
         }
@@ -2635,6 +2681,8 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       stripeRestrictedKeyConfigured: stripeRestrictedKeyConfigured(),
       stripeAutofundConfigured: stripeAutofundConfigured(),
       stripeAutofundEnabled: STRIPE_AUTOFUND_ENABLED,
+      stripeAutofundFullPayoutFromBank:
+        STRIPE_AUTOFUND_FULL_PAYOUT_FROM_BANK,
       stripeAutofundMinBalance: moneyNumber(
         STRIPE_AUTOFUND_MIN_BALANCE_CENTS / 100
       ),
