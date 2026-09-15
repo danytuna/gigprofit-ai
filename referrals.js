@@ -1428,9 +1428,21 @@ function uniqueCode(base) {
   return `${base}-${index}`;
 }
 
+function stripeGlobalPayoutsKey() {
+  return String(
+    process.env.STRIPE_GLOBAL_PAYOUTS_KEY ||
+    process.env.STRIPE_SECRET_KEY ||
+    ""
+  ).trim();
+}
+
+function stripeRestrictedKeyConfigured() {
+  return stripeGlobalPayoutsKey().startsWith("rk_");
+}
+
 function stripeGlobalPayoutsConfigured() {
   return Boolean(
-    String(process.env.STRIPE_SECRET_KEY || "").trim() &&
+    stripeRestrictedKeyConfigured() &&
     STRIPE_FINANCIAL_ACCOUNT_ID
   );
 }
@@ -1454,9 +1466,14 @@ async function stripeApiRequest(
     idempotencyKey = null,
   } = {}
 ) {
-  const secret = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const secret = stripeGlobalPayoutsKey();
   if (!secret) {
     throw new Error("Stripe bank payouts are not configured on GigProfit yet");
+  }
+  if (!secret.startsWith("rk_")) {
+    throw new Error(
+      "Stripe Global Payouts requires a live Restricted API Key (rk_live_...), not a standard secret key"
+    );
   }
 
   const headers = {
@@ -2111,6 +2128,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
       stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
+      stripeRestrictedKeyConfigured: stripeRestrictedKeyConfigured(),
       stripeBackgroundSyncEnabled: stripeGlobalPayoutsConfigured(),
       stripePayoutSyncIntervalSeconds:
         Math.round(STRIPE_PAYOUT_SYNC_INTERVAL_MS / 1000),
