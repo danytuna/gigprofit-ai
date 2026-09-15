@@ -1554,7 +1554,10 @@ async function retrieveStripeRecipientAccount(recipientId) {
     "requirements",
     "identity",
   ]
-    .map((item) => `include[]=${encodeURIComponent(item)}`)
+    .map(
+      (item, index) =>
+        `include[${index}]=${encodeURIComponent(item)}`
+    )
     .join("&");
 
   return stripeApiRequest(
