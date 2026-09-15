@@ -36,6 +36,22 @@ const STRIPE_API_VERSION =
   "2026-08-26.preview";
 const STRIPE_FINANCIAL_ACCOUNT_ID =
   String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
+const STRIPE_AUTOFUND_ENABLED =
+  String(process.env.STRIPE_AUTOFUND_ENABLED || "false").toLowerCase() === "true";
+const STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID =
+  String(process.env.STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID || "").trim();
+const STRIPE_AUTOFUND_MIN_BALANCE_CENTS = Math.max(
+  0,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_MIN_BALANCE_CENTS || 20000))
+);
+const STRIPE_AUTOFUND_TARGET_BALANCE_CENTS = Math.max(
+  STRIPE_AUTOFUND_MIN_BALANCE_CENTS,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_TARGET_BALANCE_CENTS || 50000))
+);
+const STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS = Math.max(
+  100,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS || 100000))
+);
 const STRIPE_PAYOUT_SYNC_INTERVAL_MS = Math.max(
   60_000,
   Number(process.env.STRIPE_PAYOUT_SYNC_INTERVAL_MS || 300_000)
@@ -95,11 +111,12 @@ let creatorMailer = null;
 
 let loaded = false;
 let store = {
-  version: 3,
+  version: 4,
   updatedAt: null,
   creators: {},
   payouts: {},
   accountAttributions: {},
+  funding: {},
 };
 
 let writeQueue = Promise.resolve();
@@ -880,12 +897,29 @@ function ensureCreatorShape(creator) {
 
 function ensureStoreShape(parsed = {}) {
   const next = {
-    version: 3,
+    version: 4,
     updatedAt: parsed?.updatedAt || null,
     creators: parsed?.creators || {},
     payouts: parsed?.payouts || {},
     accountAttributions: parsed?.accountAttributions || {},
+    funding: parsed?.funding || {},
   };
+
+  next.funding.activeInboundTransferId =
+    next.funding.activeInboundTransferId || null;
+  next.funding.activeIntentId =
+    next.funding.activeIntentId || null;
+  next.funding.activeAmountCents =
+    Math.max(0, Math.floor(Number(next.funding.activeAmountCents || 0)));
+  next.funding.startedAt = next.funding.startedAt || null;
+  next.funding.lastStatus = next.funding.lastStatus || null;
+  next.funding.lastError = next.funding.lastError || null;
+  next.funding.lastErrorAt = next.funding.lastErrorAt || null;
+  next.funding.lastCompletedAt = next.funding.lastCompletedAt || null;
+  next.funding.lastAvailableUsdCents =
+    Number.isFinite(Number(next.funding.lastAvailableUsdCents))
+      ? Number(next.funding.lastAvailableUsdCents)
+      : null;
 
   for (const creator of Object.values(next.creators)) {
     ensureCreatorShape(creator);
@@ -1069,7 +1103,7 @@ function creatorPayouts(code) {
 }
 
 function reservedAmountForCreator(code) {
-  const reservingStatuses = new Set(["requested", "approved", "processing"]);
+  const reservingStatuses = new Set(["requested", "approved", "funding", "processing"]);
   return moneyNumber(
     creatorPayouts(code)
       .filter((payout) => reservingStatuses.has(payout.status))
@@ -1304,6 +1338,12 @@ function payoutView(payout) {
     provider: payout.provider || null,
     providerPayoutId: payout.providerPayoutId || null,
     providerStatus: payout.providerStatus || null,
+    fundingInboundTransferId: payout.fundingInboundTransferId || null,
+    fundingAmount: payout.fundingAmountCents
+      ? moneyNumber(Number(payout.fundingAmountCents) / 100)
+      : 0,
+    fundingStartedAt: payout.fundingStartedAt || null,
+    fundingStatus: payout.fundingStatus || null,
     expectedArrivalDate: payout.expectedArrivalDate || null,
     estimatedArrival:
       payout.estimatedArrival ||
@@ -1444,6 +1484,55 @@ function stripeGlobalPayoutsConfigured() {
   return Boolean(
     stripeRestrictedKeyConfigured() &&
     STRIPE_FINANCIAL_ACCOUNT_ID
+  );
+}
+
+function stripeAutofundConfigured() {
+  return Boolean(
+    STRIPE_AUTOFUND_ENABLED &&
+    stripeGlobalPayoutsConfigured() &&
+    STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID
+  );
+}
+
+function stripeInboundPendingUsdCents(financialAccount) {
+  const value =
+    financialAccount?.balance?.inbound_pending?.usd?.value ??
+    financialAccount?.balance?.inbound_pending?.USD?.value;
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function stripeInboundTransferState(transfer) {
+  const history = Array.isArray(transfer?.transfer_history)
+    ? transfer.transfer_history
+    : [];
+  const types = history.map((entry) => String(entry?.type || "").toLowerCase());
+
+  if (types.includes("bank_debit_returned")) return "returned";
+  if (types.includes("bank_debit_failed")) return "failed";
+  if (types.includes("bank_debit_succeeded")) return "succeeded";
+  if (types.includes("bank_debit_processing")) return "processing";
+  if (types.includes("bank_debit_queued")) return "queued";
+
+  const raw = String(transfer?.status || "").toLowerCase();
+  return raw || "pending";
+}
+
+function stripeInboundTransferFailureReason(transfer) {
+  const history = Array.isArray(transfer?.transfer_history)
+    ? transfer.transfer_history
+    : [];
+  const terminal = [...history].reverse().find((entry) =>
+    ["bank_debit_failed", "bank_debit_returned"].includes(
+      String(entry?.type || "").toLowerCase()
+    )
+  );
+  if (!terminal) return null;
+  const type = String(terminal.type || "").toLowerCase();
+  return (
+    terminal?.[type]?.failure_reason ||
+    terminal?.[type]?.return_reason ||
+    type.replaceAll("_", " ")
   );
 }
 
