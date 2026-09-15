@@ -244,8 +244,8 @@ function creatorInvitationMessage(creator, accessKey) {
     referralUrl,
     "",
     "Compensation:",
-    `Reel fee: ${moneyNumber(creator.reelFee).toFixed(2)}`,
-    `Valid account-created bonus: ${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created`,
+    `Reel fee: $${moneyNumber(creator.reelFee).toFixed(2)}`,
+    `Valid account-created bonus: $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created`,
     "",
     "Use only the referral code in the Referral code field — do not paste the full referral URL.",
     "Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.",
@@ -277,8 +277,8 @@ function creatorInvitationMessage(creator, accessKey) {
 
         <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
           <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Compensation</div>
-          <p><strong>Reel fee:</strong> ${moneyNumber(creator.reelFee).toFixed(2)}</p>
-          <p><strong>Valid account-created bonus:</strong> ${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created</p>
+          <p><strong>Reel fee:</strong> $${moneyNumber(creator.reelFee).toFixed(2)}</p>
+          <p><strong>Valid account-created bonus:</strong> $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created</p>
         </div>
 
         <p style="color:#b8c0cf"><strong>Important:</strong> In the Referral code field, enter only <strong>${htmlEscape(creator.code)}</strong>, not the full referral URL.</p>
