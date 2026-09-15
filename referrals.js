@@ -3159,7 +3159,9 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         payout: payoutView(payout),
       });
     } catch (error) {
-      payout.status = "approved";
+      // Keep the request retryable if Stripe/provider could not start the payout.
+      payout.status = "requested";
+      payout.approvedAt = null;
       payout.failureReason = error?.message || String(error);
       payout.updatedAt = nowISO();
       await persist();
