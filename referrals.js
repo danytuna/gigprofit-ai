@@ -1552,7 +1552,6 @@ async function retrieveStripeRecipientAccount(recipientId) {
   const include = [
     "configuration.recipient",
     "requirements",
-    "identity",
   ]
     .map(
       (item, index) =>
