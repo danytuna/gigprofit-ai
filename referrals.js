@@ -36,6 +36,22 @@ const STRIPE_API_VERSION =
   "2026-08-26.preview";
 const STRIPE_FINANCIAL_ACCOUNT_ID =
   String(process.env.STRIPE_FINANCIAL_ACCOUNT_ID || "").trim();
+const STRIPE_AUTOFUND_ENABLED =
+  String(process.env.STRIPE_AUTOFUND_ENABLED || "false").toLowerCase() === "true";
+const STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID =
+  String(process.env.STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID || "").trim();
+const STRIPE_AUTOFUND_MIN_BALANCE_CENTS = Math.max(
+  0,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_MIN_BALANCE_CENTS || 20000))
+);
+const STRIPE_AUTOFUND_TARGET_BALANCE_CENTS = Math.max(
+  STRIPE_AUTOFUND_MIN_BALANCE_CENTS,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_TARGET_BALANCE_CENTS || 50000))
+);
+const STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS = Math.max(
+  100,
+  Math.floor(Number(process.env.STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS || 100000))
+);
 const STRIPE_PAYOUT_SYNC_INTERVAL_MS = Math.max(
   60_000,
   Number(process.env.STRIPE_PAYOUT_SYNC_INTERVAL_MS || 300_000)
@@ -95,11 +111,12 @@ let creatorMailer = null;
 
 let loaded = false;
 let store = {
-  version: 3,
+  version: 4,
   updatedAt: null,
   creators: {},
   payouts: {},
   accountAttributions: {},
+  funding: {},
 };
 
 let writeQueue = Promise.resolve();
@@ -880,12 +897,29 @@ function ensureCreatorShape(creator) {
 
 function ensureStoreShape(parsed = {}) {
   const next = {
-    version: 3,
+    version: 4,
     updatedAt: parsed?.updatedAt || null,
     creators: parsed?.creators || {},
     payouts: parsed?.payouts || {},
     accountAttributions: parsed?.accountAttributions || {},
+    funding: parsed?.funding || {},
   };
+
+  next.funding.activeInboundTransferId =
+    next.funding.activeInboundTransferId || null;
+  next.funding.activeIntentId =
+    next.funding.activeIntentId || null;
+  next.funding.activeAmountCents =
+    Math.max(0, Math.floor(Number(next.funding.activeAmountCents || 0)));
+  next.funding.startedAt = next.funding.startedAt || null;
+  next.funding.lastStatus = next.funding.lastStatus || null;
+  next.funding.lastError = next.funding.lastError || null;
+  next.funding.lastErrorAt = next.funding.lastErrorAt || null;
+  next.funding.lastCompletedAt = next.funding.lastCompletedAt || null;
+  next.funding.lastAvailableUsdCents =
+    Number.isFinite(Number(next.funding.lastAvailableUsdCents))
+      ? Number(next.funding.lastAvailableUsdCents)
+      : null;
 
   for (const creator of Object.values(next.creators)) {
     ensureCreatorShape(creator);
@@ -1069,7 +1103,7 @@ function creatorPayouts(code) {
 }
 
 function reservedAmountForCreator(code) {
-  const reservingStatuses = new Set(["requested", "approved", "processing"]);
+  const reservingStatuses = new Set(["requested", "approved", "funding", "processing"]);
   return moneyNumber(
     creatorPayouts(code)
       .filter((payout) => reservingStatuses.has(payout.status))
@@ -1304,6 +1338,12 @@ function payoutView(payout) {
     provider: payout.provider || null,
     providerPayoutId: payout.providerPayoutId || null,
     providerStatus: payout.providerStatus || null,
+    fundingInboundTransferId: payout.fundingInboundTransferId || null,
+    fundingAmount: payout.fundingAmountCents
+      ? moneyNumber(Number(payout.fundingAmountCents) / 100)
+      : 0,
+    fundingStartedAt: payout.fundingStartedAt || null,
+    fundingStatus: payout.fundingStatus || null,
     expectedArrivalDate: payout.expectedArrivalDate || null,
     estimatedArrival:
       payout.estimatedArrival ||
@@ -1444,6 +1484,55 @@ function stripeGlobalPayoutsConfigured() {
   return Boolean(
     stripeRestrictedKeyConfigured() &&
     STRIPE_FINANCIAL_ACCOUNT_ID
+  );
+}
+
+function stripeAutofundConfigured() {
+  return Boolean(
+    STRIPE_AUTOFUND_ENABLED &&
+    stripeGlobalPayoutsConfigured() &&
+    STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID
+  );
+}
+
+function stripeInboundPendingUsdCents(financialAccount) {
+  const value =
+    financialAccount?.balance?.inbound_pending?.usd?.value ??
+    financialAccount?.balance?.inbound_pending?.USD?.value;
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function stripeInboundTransferState(transfer) {
+  const history = Array.isArray(transfer?.transfer_history)
+    ? transfer.transfer_history
+    : [];
+  const types = history.map((entry) => String(entry?.type || "").toLowerCase());
+
+  if (types.includes("bank_debit_returned")) return "returned";
+  if (types.includes("bank_debit_failed")) return "failed";
+  if (types.includes("bank_debit_succeeded")) return "succeeded";
+  if (types.includes("bank_debit_processing")) return "processing";
+  if (types.includes("bank_debit_queued")) return "queued";
+
+  const raw = String(transfer?.status || "").toLowerCase();
+  return raw || "pending";
+}
+
+function stripeInboundTransferFailureReason(transfer) {
+  const history = Array.isArray(transfer?.transfer_history)
+    ? transfer.transfer_history
+    : [];
+  const terminal = [...history].reverse().find((entry) =>
+    ["bank_debit_failed", "bank_debit_returned"].includes(
+      String(entry?.type || "").toLowerCase()
+    )
+  );
+  if (!terminal) return null;
+  const type = String(terminal.type || "").toLowerCase();
+  return (
+    terminal?.[type]?.failure_reason ||
+    terminal?.[type]?.return_reason ||
+    type.replaceAll("_", " ")
   );
 }
 
@@ -1588,6 +1677,178 @@ async function retrieveStripeFundingAccount() {
       STRIPE_FINANCIAL_ACCOUNT_ID
     )}`
   );
+}
+
+async function retrieveStripeInboundTransfer(id) {
+  if (!id) return null;
+  return stripeApiRequest(
+    `/v2/money_management/inbound_transfers/${encodeURIComponent(id)}`
+  );
+}
+
+async function createStripeInboundTransfer(amountCents, intentId) {
+  if (!stripeAutofundConfigured()) {
+    throw new Error(
+      "Stripe automatic bank funding is not fully configured"
+    );
+  }
+
+  const amount = Math.max(100, Math.floor(Number(amountCents || 0)));
+  if (amount > STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS) {
+    throw new Error(
+      `Automatic bank funding is capped at ${(
+        STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS / 100
+      ).toFixed(2)} per transfer`
+    );
+  }
+
+  const endpoint = "/v2/money_management/inbound_transfers";
+  const description = "GigProfit creator payout funding".slice(0, 100);
+
+  try {
+    return await stripeApiRequest(endpoint, {
+      method: "POST",
+      idempotencyKey: intentId,
+      body: {
+        from: STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID,
+        to: {
+          financial_account: STRIPE_FINANCIAL_ACCOUNT_ID,
+        },
+        amount: {
+          value: amount,
+          currency: "usd",
+        },
+        description,
+      },
+    });
+  } catch (error) {
+    const code = String(
+      error?.stripe?.error?.code ||
+      error?.stripe?.code ||
+      ""
+    ).toLowerCase();
+    const message = String(error?.message || "").toLowerCase();
+    const schemaError =
+      Number(error?.status) === 400 &&
+      (
+        code.includes("invalid_argument") ||
+        message.includes("unknown") ||
+        message.includes("invalid") ||
+        message.includes("required")
+      );
+
+    if (!schemaError) throw error;
+
+    return stripeApiRequest(endpoint, {
+      method: "POST",
+      idempotencyKey: intentId,
+      body: {
+        from: {
+          payment_method: STRIPE_AUTOFUND_SOURCE_PAYOUT_METHOD_ID,
+        },
+        to: {
+          financial_account: STRIPE_FINANCIAL_ACCOUNT_ID,
+          balance_type: "storage",
+        },
+        money_movement_amounts: {
+          destination: {
+            value: amount,
+            currency: "usd",
+          },
+        },
+        description,
+      },
+    });
+  }
+}
+
+async function startStripeAutofund(amountCents, reason = "creator_payout") {
+  if (!stripeAutofundConfigured()) {
+    throw new Error(
+      "Automatic Stripe bank funding is disabled or missing a funding source"
+    );
+  }
+
+  const funding = store.funding || (store.funding = {});
+  if (funding.activeInboundTransferId) {
+    return {
+      alreadyActive: true,
+      id: funding.activeInboundTransferId,
+      amountCents: Number(funding.activeAmountCents || 0),
+      status: funding.lastStatus || "pending",
+    };
+  }
+
+  const amount = Math.max(100, Math.floor(Number(amountCents || 0)));
+  if (amount > STRIPE_AUTOFUND_MAX_SINGLE_DEBIT_CENTS) {
+    throw new Error(
+      `Required automatic bank funding (${(amount / 100).toFixed(2)}) exceeds the configured safety cap`
+    );
+  }
+
+  const intentId =
+    funding.activeIntentId ||
+    `gigprofit-autofund-${crypto.randomUUID()}`;
+
+  funding.activeIntentId = intentId;
+  funding.activeAmountCents = amount;
+  funding.startedAt = funding.startedAt || nowISO();
+  funding.lastStatus = "starting";
+  funding.lastError = null;
+  funding.lastErrorAt = null;
+  await persist();
+
+  try {
+    const transfer = await createStripeInboundTransfer(amount, intentId);
+    if (!transfer?.id) {
+      throw new Error("Stripe did not return an InboundTransfer ID");
+    }
+
+    funding.activeInboundTransferId = transfer.id;
+    funding.lastStatus = stripeInboundTransferState(transfer);
+    funding.lastError = null;
+    funding.lastErrorAt = null;
+    funding.reason = reason;
+    await persist();
+
+    return {
+      alreadyActive: false,
+      id: transfer.id,
+      amountCents: amount,
+      status: funding.lastStatus,
+    };
+  } catch (error) {
+    funding.lastStatus = "error";
+    funding.lastError = error?.message || String(error);
+    funding.lastErrorAt = nowISO();
+    await persist();
+    throw error;
+  }
+}
+
+function clearCompletedAutofund(status = "completed") {
+  const funding = store.funding || (store.funding = {});
+  funding.lastStatus = status;
+  funding.lastCompletedAt = nowISO();
+  funding.activeInboundTransferId = null;
+  funding.activeIntentId = null;
+  funding.activeAmountCents = 0;
+  funding.startedAt = null;
+}
+
+async function maybeStartBufferFunding(currentAvailableCents) {
+  if (!stripeAutofundConfigured()) return null;
+
+  const available = Math.max(0, Number(currentAvailableCents || 0));
+  if (available >= STRIPE_AUTOFUND_MIN_BALANCE_CENTS) return null;
+  if (store.funding?.activeInboundTransferId) return null;
+
+  const amount = Math.max(
+    100,
+    STRIPE_AUTOFUND_TARGET_BALANCE_CENTS - available
+  );
+
+  return startStripeAutofund(amount, "buffer_replenishment");
 }
 
 function stripeAvailableUsdCents(financialAccount) {
@@ -1784,16 +2045,58 @@ async function sendStripeBankPayout(payout) {
   const amountCents = Math.round(Number(payout.amount) * 100);
   const fundingAccount = await retrieveStripeFundingAccount();
   const availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  store.funding ||= {};
+  store.funding.lastAvailableUsdCents = availableUsdCents;
+
   if (
     availableUsdCents !== null &&
     availableUsdCents < amountCents
   ) {
-    throw new Error(
-      `Insufficient Stripe Global Payouts balance. Available: ${(
-        availableUsdCents / 100
-      ).toFixed(2)}; requested: ${(amountCents / 100).toFixed(2)}`
+    if (!stripeAutofundConfigured()) {
+      throw new Error(
+        `Insufficient Stripe Global Payouts balance. Available: ${(
+          availableUsdCents / 100
+        ).toFixed(2)}; requested: ${(amountCents / 100).toFixed(2)}`
+      );
+    }
+
+    const desiredBalance = Math.max(
+      amountCents,
+      STRIPE_AUTOFUND_TARGET_BALANCE_CENTS
     );
+    const fundingAmountCents = Math.max(
+      100,
+      desiredBalance - availableUsdCents
+    );
+    const fundingResult = await startStripeAutofund(
+      fundingAmountCents,
+      `payout:${payout.id}`
+    );
+
+    payout.status = "funding";
+    payout.provider = "stripe_global_payouts";
+    payout.providerStatus = "FUNDING";
+    payout.fundingInboundTransferId = fundingResult.id || null;
+    payout.fundingAmountCents = fundingResult.amountCents || fundingAmountCents;
+    payout.fundingStartedAt = payout.fundingStartedAt || nowISO();
+    payout.fundingStatus = fundingResult.status || "pending";
+    payout.estimatedArrival =
+      "Funding bank transfer in progress; payout sends automatically when funds are available";
+    payout.updatedAt = nowISO();
+    await persist();
+
+    return {
+      mode: "automated",
+      status: "funding",
+      provider: "stripe_global_payouts",
+      providerPayoutId: null,
+      providerStatus: "FUNDING",
+      fundingInboundTransferId: payout.fundingInboundTransferId,
+      fundingAmountCents: payout.fundingAmountCents,
+      raw: fundingResult,
+    };
   }
+
   const data = await stripeApiRequest(
     "/v2/money_management/outbound_payments",
     {
@@ -1817,6 +2120,24 @@ async function sendStripeBankPayout(payout) {
       },
     }
   );
+
+  const remainingAfterSend =
+    availableUsdCents === null
+      ? null
+      : Math.max(0, availableUsdCents - amountCents);
+
+  if (
+    remainingAfterSend !== null &&
+    stripeAutofundConfigured() &&
+    remainingAfterSend < STRIPE_AUTOFUND_MIN_BALANCE_CENTS
+  ) {
+    void maybeStartBufferFunding(remainingAfterSend).catch((error) => {
+      console.error(
+        "STRIPE AUTOFUND BUFFER ERROR:",
+        error?.message || error
+      );
+    });
+  }
 
   return {
     mode: "automated",
@@ -1891,6 +2212,168 @@ async function syncStripePayout(payout) {
 
   payout.updatedAt = nowISO();
   return true;
+}
+
+async function syncStripeAutofundingAndFundedPayouts() {
+  if (!stripeAutofundConfigured()) return false;
+
+  let changed = false;
+  const funding = store.funding || (store.funding = {});
+  let fundingAccount = await retrieveStripeFundingAccount();
+  let availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  const inboundPendingUsdCents = stripeInboundPendingUsdCents(fundingAccount);
+  funding.lastAvailableUsdCents = availableUsdCents;
+
+  if (funding.activeInboundTransferId) {
+    try {
+      const transfer = await retrieveStripeInboundTransfer(
+        funding.activeInboundTransferId
+      );
+      const state = stripeInboundTransferState(transfer);
+      funding.lastStatus = state;
+      funding.lastError = null;
+      funding.lastErrorAt = null;
+
+      if (["failed", "returned"].includes(state)) {
+        const reason =
+          stripeInboundTransferFailureReason(transfer) ||
+          "Bank funding transfer failed or was returned";
+        funding.lastError = reason;
+        funding.lastErrorAt = nowISO();
+
+        for (const payout of Object.values(store.payouts || {})) {
+          if (
+            payout.status === "funding" &&
+            payout.fundingInboundTransferId === funding.activeInboundTransferId
+          ) {
+            payout.status = "requested";
+            payout.approvedAt = null;
+            payout.failureReason =
+              `Automatic bank funding failed: ${reason}`;
+            payout.fundingStatus = state;
+            payout.updatedAt = nowISO();
+          }
+        }
+
+        clearCompletedAutofund(state);
+        changed = true;
+      } else if (
+        state === "succeeded" &&
+        inboundPendingUsdCents === 0
+      ) {
+        clearCompletedAutofund("available");
+        changed = true;
+      }
+    } catch (error) {
+      funding.lastError = error?.message || String(error);
+      funding.lastErrorAt = nowISO();
+    }
+  }
+
+  fundingAccount = await retrieveStripeFundingAccount();
+  availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  funding.lastAvailableUsdCents = availableUsdCents;
+
+  const fundedPayouts = Object.values(store.payouts || {})
+    .filter(
+      (payout) =>
+        payout.method === "bank_account" &&
+        payout.status === "funding"
+    )
+    .sort((a, b) =>
+      String(a.approvedAt || a.createdAt).localeCompare(
+        String(b.approvedAt || b.createdAt)
+      )
+    );
+
+  for (const payout of fundedPayouts) {
+    const amountCents = Math.round(Number(payout.amount || 0) * 100);
+    if (
+      availableUsdCents === null ||
+      availableUsdCents < amountCents
+    ) {
+      continue;
+    }
+
+    try {
+      payout.fundingStatus = "available";
+      const result = await sendStripeBankPayout(payout);
+      payout.provider = result.provider || "stripe_global_payouts";
+      payout.providerPayoutId = result.providerPayoutId || null;
+      payout.providerStatus = result.providerStatus || null;
+      payout.expectedArrivalDate =
+        result.expectedArrivalDate ||
+        payout.expectedArrivalDate ||
+        null;
+
+      if (result.status === "paid") {
+        finalizePaidPayout(payout);
+        await notifyPayoutOnce(payout, "paid");
+      } else if (result.status === "processing") {
+        payout.status = "processing";
+        await notifyPayoutOnce(payout, "approved");
+      } else if (result.status === "funding") {
+        payout.status = "funding";
+      }
+
+      payout.updatedAt = nowISO();
+      availableUsdCents = Math.max(0, availableUsdCents - amountCents);
+      changed = true;
+    } catch (error) {
+      payout.failureReason = error?.message || String(error);
+      payout.updatedAt = nowISO();
+      changed = true;
+    }
+  }
+
+  const stillFunding = Object.values(store.payouts || {}).filter(
+    (payout) =>
+      payout.method === "bank_account" &&
+      payout.status === "funding"
+  );
+
+  if (
+    stillFunding.length &&
+    !store.funding?.activeInboundTransferId &&
+    availableUsdCents !== null
+  ) {
+    const totalNeeded = stillFunding.reduce(
+      (sum, payout) =>
+        sum + Math.round(Number(payout.amount || 0) * 100),
+      0
+    );
+
+    if (availableUsdCents < totalNeeded) {
+      const desired = Math.max(
+        totalNeeded,
+        STRIPE_AUTOFUND_TARGET_BALANCE_CENTS
+      );
+      const amount = Math.max(100, desired - availableUsdCents);
+
+      try {
+        const result = await startStripeAutofund(
+          amount,
+          "queued_creator_payouts"
+        );
+        for (const payout of stillFunding) {
+          if (!payout.fundingInboundTransferId) {
+            payout.fundingInboundTransferId = result.id || null;
+            payout.fundingAmountCents = result.amountCents || amount;
+            payout.fundingStartedAt =
+              payout.fundingStartedAt || nowISO();
+            payout.fundingStatus = result.status || "pending";
+          }
+        }
+        changed = true;
+      } catch (error) {
+        funding.lastError = error?.message || String(error);
+        funding.lastErrorAt = nowISO();
+      }
+    }
+  }
+
+  if (changed) await persist();
+  return changed;
 }
 
 async function syncProcessingStripePayoutsForCreator(code) {
@@ -2038,6 +2521,17 @@ function startStripeBackgroundSync() {
       await ensureLoaded();
       let changed = false;
 
+      try {
+        changed =
+          (await syncStripeAutofundingAndFundedPayouts()) ||
+          changed;
+      } catch (error) {
+        console.error(
+          "STRIPE AUTOFUND BACKGROUND ERROR:",
+          error?.message || error
+        );
+      }
+
       for (const creator of Object.values(store.creators)) {
         ensureCreatorShape(creator);
 
@@ -2123,12 +2617,30 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     return res.json({
       ok: true,
       service: "gigprofit-referrals",
-      version: 3,
+      version: 4,
       creators: Object.keys(store.creators).length,
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
       stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
       stripeRestrictedKeyConfigured: stripeRestrictedKeyConfigured(),
+      stripeAutofundConfigured: stripeAutofundConfigured(),
+      stripeAutofundEnabled: STRIPE_AUTOFUND_ENABLED,
+      stripeAutofundMinBalance: moneyNumber(
+        STRIPE_AUTOFUND_MIN_BALANCE_CENTS / 100
+      ),
+      stripeAutofundTargetBalance: moneyNumber(
+        STRIPE_AUTOFUND_TARGET_BALANCE_CENTS / 100
+      ),
+      stripeAutofundStatus: {
+        active: Boolean(store.funding?.activeInboundTransferId),
+        lastStatus: store.funding?.lastStatus || null,
+        lastError: store.funding?.lastError || null,
+        lastAvailableBalance:
+          store.funding?.lastAvailableUsdCents === null ||
+          store.funding?.lastAvailableUsdCents === undefined
+            ? null
+            : moneyNumber(store.funding.lastAvailableUsdCents / 100),
+      },
       stripeBackgroundSyncEnabled: stripeGlobalPayoutsConfigured(),
       stripePayoutSyncIntervalSeconds:
         Math.round(STRIPE_PAYOUT_SYNC_INTERVAL_MS / 1000),
@@ -3485,6 +3997,18 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
           providerResult.raw?.error ||
           providerResult.raw?.message ||
           "Payout provider declined the payout";
+      } else if (providerResult.status === "funding") {
+        payout.status = "funding";
+        payout.fundingInboundTransferId =
+          providerResult.fundingInboundTransferId ||
+          payout.fundingInboundTransferId ||
+          null;
+        payout.fundingAmountCents =
+          providerResult.fundingAmountCents ||
+          payout.fundingAmountCents ||
+          0;
+        payout.fundingStartedAt = payout.fundingStartedAt || nowISO();
+        payout.fundingStatus = "pending";
       } else if (providerResult.status === "processing") {
         payout.status = "processing";
       } else {
@@ -3496,7 +4020,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
 
       if (payout.status === "paid") {
         await notifyPayoutOnce(payout, "paid");
-      } else if (["approved", "processing"].includes(payout.status)) {
+      } else if (["approved", "funding", "processing"].includes(payout.status)) {
         await notifyPayoutOnce(payout, "approved");
       }
       await persist();
@@ -3560,7 +4084,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       return res.status(404).json({ error: "Payout not found" });
     }
 
-    if (!["requested", "approved", "processing"].includes(payout.status)) {
+    if (!["requested", "approved", "funding", "processing"].includes(payout.status)) {
       return res.status(409).json({
         error: `Cannot mark a payout in ${payout.status} state as paid`,
       });
