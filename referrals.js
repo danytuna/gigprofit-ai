@@ -2214,6 +2214,168 @@ async function syncStripePayout(payout) {
   return true;
 }
 
+async function syncStripeAutofundingAndFundedPayouts() {
+  if (!stripeAutofundConfigured()) return false;
+
+  let changed = false;
+  const funding = store.funding || (store.funding = {});
+  let fundingAccount = await retrieveStripeFundingAccount();
+  let availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  const inboundPendingUsdCents = stripeInboundPendingUsdCents(fundingAccount);
+  funding.lastAvailableUsdCents = availableUsdCents;
+
+  if (funding.activeInboundTransferId) {
+    try {
+      const transfer = await retrieveStripeInboundTransfer(
+        funding.activeInboundTransferId
+      );
+      const state = stripeInboundTransferState(transfer);
+      funding.lastStatus = state;
+      funding.lastError = null;
+      funding.lastErrorAt = null;
+
+      if (["failed", "returned"].includes(state)) {
+        const reason =
+          stripeInboundTransferFailureReason(transfer) ||
+          "Bank funding transfer failed or was returned";
+        funding.lastError = reason;
+        funding.lastErrorAt = nowISO();
+
+        for (const payout of Object.values(store.payouts || {})) {
+          if (
+            payout.status === "funding" &&
+            payout.fundingInboundTransferId === funding.activeInboundTransferId
+          ) {
+            payout.status = "requested";
+            payout.approvedAt = null;
+            payout.failureReason =
+              `Automatic bank funding failed: ${reason}`;
+            payout.fundingStatus = state;
+            payout.updatedAt = nowISO();
+          }
+        }
+
+        clearCompletedAutofund(state);
+        changed = true;
+      } else if (
+        state === "succeeded" &&
+        inboundPendingUsdCents === 0
+      ) {
+        clearCompletedAutofund("available");
+        changed = true;
+      }
+    } catch (error) {
+      funding.lastError = error?.message || String(error);
+      funding.lastErrorAt = nowISO();
+    }
+  }
+
+  fundingAccount = await retrieveStripeFundingAccount();
+  availableUsdCents = stripeAvailableUsdCents(fundingAccount);
+  funding.lastAvailableUsdCents = availableUsdCents;
+
+  const fundedPayouts = Object.values(store.payouts || {})
+    .filter(
+      (payout) =>
+        payout.method === "bank_account" &&
+        payout.status === "funding"
+    )
+    .sort((a, b) =>
+      String(a.approvedAt || a.createdAt).localeCompare(
+        String(b.approvedAt || b.createdAt)
+      )
+    );
+
+  for (const payout of fundedPayouts) {
+    const amountCents = Math.round(Number(payout.amount || 0) * 100);
+    if (
+      availableUsdCents === null ||
+      availableUsdCents < amountCents
+    ) {
+      continue;
+    }
+
+    try {
+      payout.fundingStatus = "available";
+      const result = await sendStripeBankPayout(payout);
+      payout.provider = result.provider || "stripe_global_payouts";
+      payout.providerPayoutId = result.providerPayoutId || null;
+      payout.providerStatus = result.providerStatus || null;
+      payout.expectedArrivalDate =
+        result.expectedArrivalDate ||
+        payout.expectedArrivalDate ||
+        null;
+
+      if (result.status === "paid") {
+        finalizePaidPayout(payout);
+        await notifyPayoutOnce(payout, "paid");
+      } else if (result.status === "processing") {
+        payout.status = "processing";
+        await notifyPayoutOnce(payout, "approved");
+      } else if (result.status === "funding") {
+        payout.status = "funding";
+      }
+
+      payout.updatedAt = nowISO();
+      availableUsdCents = Math.max(0, availableUsdCents - amountCents);
+      changed = true;
+    } catch (error) {
+      payout.failureReason = error?.message || String(error);
+      payout.updatedAt = nowISO();
+      changed = true;
+    }
+  }
+
+  const stillFunding = Object.values(store.payouts || {}).filter(
+    (payout) =>
+      payout.method === "bank_account" &&
+      payout.status === "funding"
+  );
+
+  if (
+    stillFunding.length &&
+    !store.funding?.activeInboundTransferId &&
+    availableUsdCents !== null
+  ) {
+    const totalNeeded = stillFunding.reduce(
+      (sum, payout) =>
+        sum + Math.round(Number(payout.amount || 0) * 100),
+      0
+    );
+
+    if (availableUsdCents < totalNeeded) {
+      const desired = Math.max(
+        totalNeeded,
+        STRIPE_AUTOFUND_TARGET_BALANCE_CENTS
+      );
+      const amount = Math.max(100, desired - availableUsdCents);
+
+      try {
+        const result = await startStripeAutofund(
+          amount,
+          "queued_creator_payouts"
+        );
+        for (const payout of stillFunding) {
+          if (!payout.fundingInboundTransferId) {
+            payout.fundingInboundTransferId = result.id || null;
+            payout.fundingAmountCents = result.amountCents || amount;
+            payout.fundingStartedAt =
+              payout.fundingStartedAt || nowISO();
+            payout.fundingStatus = result.status || "pending";
+          }
+        }
+        changed = true;
+      } catch (error) {
+        funding.lastError = error?.message || String(error);
+        funding.lastErrorAt = nowISO();
+      }
+    }
+  }
+
+  if (changed) await persist();
+  return changed;
+}
+
 async function syncProcessingStripePayoutsForCreator(code) {
   const cutoff =
     Date.now() -
@@ -2359,6 +2521,17 @@ function startStripeBackgroundSync() {
       await ensureLoaded();
       let changed = false;
 
+      try {
+        changed =
+          (await syncStripeAutofundingAndFundedPayouts()) ||
+          changed;
+      } catch (error) {
+        console.error(
+          "STRIPE AUTOFUND BACKGROUND ERROR:",
+          error?.message || error
+        );
+      }
+
       for (const creator of Object.values(store.creators)) {
         ensureCreatorShape(creator);
 
@@ -2444,12 +2617,30 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     return res.json({
       ok: true,
       service: "gigprofit-referrals",
-      version: 3,
+      version: 4,
       creators: Object.keys(store.creators).length,
       payouts: Object.keys(store.payouts).length,
       payoutAutomationConfigured: payoutAutomationConfigured(),
       stripeBankPayoutsConfigured: stripeGlobalPayoutsConfigured(),
       stripeRestrictedKeyConfigured: stripeRestrictedKeyConfigured(),
+      stripeAutofundConfigured: stripeAutofundConfigured(),
+      stripeAutofundEnabled: STRIPE_AUTOFUND_ENABLED,
+      stripeAutofundMinBalance: moneyNumber(
+        STRIPE_AUTOFUND_MIN_BALANCE_CENTS / 100
+      ),
+      stripeAutofundTargetBalance: moneyNumber(
+        STRIPE_AUTOFUND_TARGET_BALANCE_CENTS / 100
+      ),
+      stripeAutofundStatus: {
+        active: Boolean(store.funding?.activeInboundTransferId),
+        lastStatus: store.funding?.lastStatus || null,
+        lastError: store.funding?.lastError || null,
+        lastAvailableBalance:
+          store.funding?.lastAvailableUsdCents === null ||
+          store.funding?.lastAvailableUsdCents === undefined
+            ? null
+            : moneyNumber(store.funding.lastAvailableUsdCents / 100),
+      },
       stripeBackgroundSyncEnabled: stripeGlobalPayoutsConfigured(),
       stripePayoutSyncIntervalSeconds:
         Math.round(STRIPE_PAYOUT_SYNC_INTERVAL_MS / 1000),
