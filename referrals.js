@@ -882,12 +882,118 @@ function ensureStoreShape(parsed = {}) {
   return next;
 }
 
+function creatorActivityScore(creator) {
+  ensureCreatorShape(creator);
+  const metrics = creator.metrics || {};
+  return [
+    Number((creator.reels || []).length > 0),
+    Number((creator.reels || []).some((reel) => ["approved", "pending"].includes(reel.status))),
+    Number(metrics.clicks || 0) +
+      Number(metrics.installs || 0) +
+      Number(metrics.accountsCreated || 0),
+    Number(metrics.paidEarnings || 0),
+    Number(Boolean(creator.bankPayout?.connected || creator.cashApp?.cashtag)),
+  ];
+}
+
+function compareCanonicalCreators(a, b) {
+  const as = creatorActivityScore(a.creator);
+  const bs = creatorActivityScore(b.creator);
+
+  for (let i = 0; i < as.length; i += 1) {
+    if (as[i] !== bs[i]) return bs[i] - as[i];
+  }
+
+  const at = Date.parse(a.creator.createdAt || "") || Number.MAX_SAFE_INTEGER;
+  const bt = Date.parse(b.creator.createdAt || "") || Number.MAX_SAFE_INTEGER;
+  if (at !== bt) return at - bt;
+
+  return String(a.code).localeCompare(String(b.code));
+}
+
+function dedupeCreatorsByEmail(inputStore) {
+  const groups = new Map();
+
+  for (const [code, creator] of Object.entries(inputStore.creators || {})) {
+    const email = normalizeEmail(creator?.email);
+    if (!email) continue;
+    if (!groups.has(email)) groups.set(email, []);
+    groups.get(email).push({ code, creator });
+  }
+
+  const removed = [];
+  const remap = new Map();
+
+  for (const [email, entries] of groups.entries()) {
+    if (entries.length <= 1) continue;
+
+    const ordered = [...entries].sort(compareCanonicalCreators);
+    const keep = ordered[0];
+
+    for (const duplicate of ordered.slice(1)) {
+      removed.push({
+        email,
+        keptCode: keep.code,
+        removedCode: duplicate.code,
+      });
+      remap.set(duplicate.code, keep.code);
+      delete inputStore.creators[duplicate.code];
+    }
+  }
+
+  if (remap.size) {
+    for (const payout of Object.values(inputStore.payouts || {})) {
+      const mappedCode = remap.get(payout.creatorCode);
+      if (!mappedCode) continue;
+      const canonical = inputStore.creators[mappedCode];
+      payout.creatorCode = mappedCode;
+      if (canonical?.name) payout.creatorName = canonical.name;
+      payout.updatedAt = nowISO();
+    }
+
+    for (const attribution of Object.values(inputStore.accountAttributions || {})) {
+      const mappedCode = remap.get(attribution?.creatorCode);
+      if (mappedCode) attribution.creatorCode = mappedCode;
+    }
+  }
+
+  return { changed: removed.length > 0, removed };
+}
+
 async function ensureLoaded() {
   if (loaded) return;
 
   try {
     const raw = await fs.readFile(DATA_PATH, "utf8");
-    store = ensureStoreShape(JSON.parse(raw));
+    const parsed = ensureStoreShape(JSON.parse(raw));
+    const dedupe = dedupeCreatorsByEmail(parsed);
+
+    if (dedupe.changed) {
+      const dir = path.dirname(DATA_PATH);
+      await fs.mkdir(dir, { recursive: true });
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const ext = path.extname(DATA_PATH) || ".json";
+      const base = ext ? DATA_PATH.slice(0, -ext.length) : DATA_PATH;
+      const backupPath = `${base}.backup.${timestamp}${ext}`;
+      await fs.writeFile(backupPath, raw, "utf8");
+
+      parsed.updatedAt = nowISO();
+      const tempPath = `${DATA_PATH}.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(parsed, null, 2), "utf8");
+      await fs.rename(tempPath, DATA_PATH);
+
+      console.log(
+        "REFERRAL DUPLICATE CREATOR CLEANUP:",
+        JSON.stringify({
+          backupPath,
+          removed: dedupe.removed,
+          remainingCreators: Object.keys(parsed.creators).length,
+        })
+      );
+    }
+
+    store = parsed;
   } catch (error) {
     if (error?.code !== "ENOENT") {
       console.error("REFERRAL DATA LOAD ERROR:", error);
