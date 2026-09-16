@@ -2776,6 +2776,61 @@ function startStripeBackgroundSync() {
   setTimeout(run, 15_000).unref?.();
 }
 
+export async function recordReferralSubscriptionForUid(uid) {
+  await ensureLoaded();
+
+  const normalizedUid = String(uid || "").trim();
+  if (!normalizedUid) {
+    return { counted: false, reason: "missing_uid" };
+  }
+
+  store.accountAttributions ||= {};
+  const attributionKey = hashSecret(
+    `gigprofit-account-attribution:${normalizedUid}`
+  );
+  const attribution = store.accountAttributions[attributionKey];
+
+  if (!attribution) {
+    return { counted: false, reason: "no_referral_attribution" };
+  }
+
+  const creator = store.creators[attribution.creatorCode];
+  if (!creator || creator.status !== "active") {
+    return {
+      counted: false,
+      reason: "creator_not_active",
+      creatorCode: attribution.creatorCode || null,
+    };
+  }
+
+  ensureCreatorShape(creator);
+
+  if (attribution.subscriptionCountedAt) {
+    return {
+      counted: false,
+      alreadyCounted: true,
+      creatorCode: creator.code,
+      subscriptions: Number(creator.metrics.subscriptions || 0),
+    };
+  }
+
+  const timestamp = nowISO();
+  attribution.subscriptionCountedAt = timestamp;
+  attribution.subscriptionCreatorCode = creator.code;
+  creator.metrics.subscriptions =
+    Number(creator.metrics.subscriptions || 0) + 1;
+  creator.updatedAt = timestamp;
+
+  await persist();
+
+  return {
+    counted: true,
+    creatorCode: creator.code,
+    subscriptions: creator.metrics.subscriptions,
+    creditedAt: timestamp,
+  };
+}
+
 export function createReferralRouter({ requireFirebaseAuth } = {}) {
   const router = express.Router();
 
@@ -2920,19 +2975,24 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         });
       }
 
+      const attributedAt = nowISO();
       store.accountAttributions[attributionKey] = {
         creatorCode: code,
-        createdAt: nowISO(),
+        createdAt: attributedAt,
         emailHash: req.auth?.email
           ? hashSecret(
               `gigprofit-account-email:${normalizeEmail(req.auth.email)}`
             )
           : null,
+        validDownloadCountedAt: attributedAt,
+        subscriptionCountedAt: null,
       };
 
       creator.metrics.accountsCreated =
         Number(creator.metrics.accountsCreated || 0) + 1;
-      creator.updatedAt = nowISO();
+      creator.metrics.installs =
+        Number(creator.metrics.installs || 0) + 1;
+      creator.updatedAt = attributedAt;
       await persist();
 
       return res.status(201).json({
@@ -2940,6 +3000,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         counted: true,
         creatorCode: code,
         accountsCreated: creator.metrics.accountsCreated,
+        validDownloads: creator.metrics.installs,
       });
     }
   );
