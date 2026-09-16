@@ -28,7 +28,12 @@ const DATA_PATH =
 
 const MAX_RECENT_FINGERPRINTS = 1500;
 const UNIQUE_WINDOW_DAYS = 14;
-const DEFAULT_ACCOUNT_BONUS = 1;
+const DEFAULT_ACCOUNT_BONUS = 0;
+const DEFAULT_DOWNLOAD_BONUS = 0.50;
+const DEFAULT_SUBSCRIPTION_BONUS = 1;
+const CREATOR_AGREEMENT_VERSION = "2026-09-16";
+const CREATOR_REEL_MIN_PUBLIC_DAYS = 30;
+const CREATOR_PRO_REIMBURSEMENT_DAYS = 30;
 const MIN_PAYOUT = Math.max(0, Number(process.env.REFERRAL_MIN_PAYOUT || 0));
 
 const STRIPE_API_VERSION =
@@ -225,6 +230,45 @@ function htmlEscape(value) {
     .replaceAll("'", "&#39;");
 }
 
+function creatorAgreementTerms(creator) {
+  ensureCreatorShape(creator);
+  return {
+    version: CREATOR_AGREEMENT_VERSION,
+    company: "Nova Prime LLC",
+    product: "GigProfit",
+    reelFee: moneyNumber(creator.reelFee),
+    minimumPublicDays: CREATOR_REEL_MIN_PUBLIC_DAYS,
+    downloadBonus: moneyNumber(creator.downloadBonus),
+    subscriptionBonus: moneyNumber(creator.subscriptionBonus),
+    subscriptionBonusRecurring: false,
+    refundsReverseCreatorBonus: false,
+    proReimbursementDays: CREATOR_PRO_REIMBURSEMENT_DAYS,
+    minimumCashOut: MIN_PAYOUT,
+    payoutEstimate: `${PAYOUT_ESTIMATE_MIN_DAYS}–${PAYOUT_ESTIMATE_MAX_DAYS} business days`,
+    exclusivityRequired: false,
+    repostPermission: true,
+  };
+}
+
+function creatorAgreementSummaryLines(creator) {
+  const terms = creatorAgreementTerms(creator);
+  return [
+    `$ ${terms.reelFee.toFixed(2)} for one approved Reel after it is publicly published.`.replace("$ ", "$"),
+    `The Reel must remain public for at least ${terms.minimumPublicDays} days, tag GigProfit, and direct viewers to the creator referral link.`,
+    "The creator controls the Reel length, style, and publication timing.",
+    "Posting the same Reel on multiple platforms is still one Reel fee.",
+    `$ ${terms.downloadBonus.toFixed(2)} per valid attributed download.`.replace("$ ", "$"),
+    `$ ${terms.subscriptionBonus.toFixed(2)} one time per valid attributed subscription.`.replace("$ ", "$"),
+    "Creator commissions already credited are not reversed solely because a referred subscriber later cancels or receives a refund.",
+    `GigProfit Pro evaluation: creator purchases Pro and Nova Prime LLC reimburses up to one month covering ${terms.proReimbursementDays} days of evaluation.`,
+    "No exclusivity is required. The creator may work with other brands.",
+    "Nova Prime LLC may organically repost the published Reel on GigProfit-owned social channels.",
+    "Fraudulent, artificial, duplicated, bot-generated, or manipulated traffic is not eligible for creator compensation.",
+    `Cash Out has no minimum when the configured minimum is $0. Normal processing is estimated at ${terms.payoutEstimate}.`,
+    "Additional paid Reels are not automatic and remain subject to Creator Portal eligibility rules and owner approval.",
+  ];
+}
+
 function creatorEmailConfigured() {
   return Boolean(
     String(process.env.CREATOR_EMAIL_SMTP_USER || "").trim() &&
@@ -273,11 +317,12 @@ function creatorInvitationMessage(creator, accessKey) {
     referralUrl,
     "",
     "Compensation:",
-    `Reel fee: $${moneyNumber(creator.reelFee).toFixed(2)}`,
-    `Valid account-created bonus: $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created`,
+    `Reel fee: ${moneyNumber(creator.reelFee).toFixed(2)} after the published Reel is approved`,
+    `Valid download bonus: ${moneyNumber(creator.downloadBonus).toFixed(2)} per valid attributed download`,
+    `Valid subscription bonus: ${moneyNumber(creator.subscriptionBonus).toFixed(2)} one time per valid attributed subscription`,
     "",
     "Use only the referral code in the Referral code field — do not paste the full referral URL.",
-    "Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.",
+    "Keep your access key private. Your dashboard shows valid downloads, subscriptions, earnings, available balance, and Cash Out requests. Clicks are analytics only.",
     "",
     `Creator support: ${CONTACT_EMAIL}`,
     "",
@@ -306,12 +351,13 @@ function creatorInvitationMessage(creator, accessKey) {
 
         <div style="background:#0b0e14;border-radius:14px;padding:18px;margin:22px 0">
           <div style="color:#8f9aab;font-size:12px;text-transform:uppercase">Compensation</div>
-          <p><strong>Reel fee:</strong> $${moneyNumber(creator.reelFee).toFixed(2)}</p>
-          <p><strong>Valid account-created bonus:</strong> $${moneyNumber(creator.accountBonus).toFixed(2)} per valid GigProfit account created</p>
+          <p><strong>Reel fee:</strong> ${moneyNumber(creator.reelFee).toFixed(2)} after the published Reel is approved</p>
+          <p><strong>Valid download bonus:</strong> ${moneyNumber(creator.downloadBonus).toFixed(2)} per valid attributed download</p>
+          <p><strong>Valid subscription bonus:</strong> ${moneyNumber(creator.subscriptionBonus).toFixed(2)} one time per valid attributed subscription</p>
         </div>
 
         <p style="color:#b8c0cf"><strong>Important:</strong> In the Referral code field, enter only <strong>${htmlEscape(creator.code)}</strong>, not the full referral URL.</p>
-        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows downloads, valid accounts created, earnings, available balance, and Cash Out requests. Downloads and clicks are analytics only and do not directly generate creator compensation.</p>
+        <p style="color:#b8c0cf">Keep your access key private. Your dashboard shows valid downloads, subscriptions, earnings, available balance, and Cash Out requests. Clicks are analytics only.</p>
         <p style="color:#8f9aab;margin-top:28px">Creator support: <a style="color:#69a3ff" href="mailto:${htmlEscape(CONTACT_EMAIL)}">${htmlEscape(CONTACT_EMAIL)}</a></p>
         <div style="color:#687284;font-size:12px;margin-top:26px">GigProfit · Nova Prime LLC</div>
       </div>
@@ -418,6 +464,40 @@ async function sendProgramEmail({ to, subject, title, textLines = [], htmlLines 
       error: error?.message || String(error),
     };
   }
+}
+
+async function sendCreatorAgreementRequest(creator, token) {
+  if (!creator?.email) {
+    return { sent: false, error: "Creator email missing" };
+  }
+
+  const agreementUrl =
+    `${CREATOR_PORTAL_URL}?agreement=${encodeURIComponent(creator.code)}&token=${encodeURIComponent(token)}`;
+  const lines = creatorAgreementSummaryLines(creator);
+
+  return sendProgramEmail({
+    to: creator.email,
+    subject: "GigProfit Creator Collaboration Agreement — signature requested",
+    title: "Creator Collaboration Agreement",
+    textLines: [
+      `Hi ${creator.name},`,
+      "Nova Prime LLC has signed the GigProfit Creator Collaboration Agreement.",
+      "Please review and electronically accept the terms before your Creator account is activated.",
+      "",
+      ...lines.map((line) => `• ${line}`),
+      "",
+      `Review and sign: ${agreementUrl}`,
+      "",
+      "Your Creator Portal credentials and referral access are issued only after both parties have signed.",
+    ],
+    htmlLines: [
+      `<p>Hi ${htmlEscape(creator.name)},</p>`,
+      "<p>Nova Prime LLC has signed your GigProfit Creator Collaboration Agreement. Please review and electronically accept it before your Creator account is activated.</p>",
+      `<div style="background:#0b0e14;border-radius:14px;padding:18px;margin:18px 0">${lines.map((line) => `<p>• ${htmlEscape(line)}</p>`).join("")}</div>`,
+      `<p><a style="display:inline-block;background:#ff7a1a;color:#111;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:10px" href="${htmlEscape(agreementUrl)}">Review & Sign Agreement</a></p>`,
+      "<p style=\"color:#b8c0cf\">Creator credentials and referral access are sent only after both signatures are recorded.</p>",
+    ],
+  });
 }
 
 async function sendOwnerReelReviewNotification(creator, reel) {
@@ -749,12 +829,43 @@ function ensureCreatorShape(creator) {
   creator.reelFee = moneyNumber(creator.reelFee);
   creator.accountBonus = moneyNumber(
     creator.accountBonus ??
-    creator.downloadBonus ??
-    creator.commissionPerDownload ??
     DEFAULT_ACCOUNT_BONUS
   );
-  // Legacy field retained only for old stored records/UI compatibility.
-  creator.downloadBonus = creator.accountBonus;
+  creator.downloadBonus = moneyNumber(
+    creator.downloadRate ??
+    creator.downloadCompensation ??
+    DEFAULT_DOWNLOAD_BONUS
+  );
+  creator.subscriptionBonus = moneyNumber(
+    creator.subscriptionRate ??
+    creator.subscriptionCompensation ??
+    DEFAULT_SUBSCRIPTION_BONUS
+  );
+  creator.downloadRate = creator.downloadBonus;
+  creator.subscriptionRate = creator.subscriptionBonus;
+
+  creator.agreement ||= {
+    version: CREATOR_AGREEMENT_VERSION,
+    status: creator.status === "active" ? "legacy_active" : "not_started",
+    ownerSignedAt: null,
+    ownerSignerName: null,
+    creatorSignedAt: null,
+    creatorSignerName: null,
+    tokenHash: null,
+    tokenIssuedAt: null,
+    invitation: {},
+  };
+  creator.agreement.version = creator.agreement.version || CREATOR_AGREEMENT_VERSION;
+  creator.agreement.status =
+    creator.agreement.status ||
+    (creator.status === "active" ? "legacy_active" : "not_started");
+  creator.agreement.ownerSignedAt = creator.agreement.ownerSignedAt || null;
+  creator.agreement.ownerSignerName = creator.agreement.ownerSignerName || null;
+  creator.agreement.creatorSignedAt = creator.agreement.creatorSignedAt || null;
+  creator.agreement.creatorSignerName = creator.agreement.creatorSignerName || null;
+  creator.agreement.tokenHash = creator.agreement.tokenHash || null;
+  creator.agreement.tokenIssuedAt = creator.agreement.tokenIssuedAt || null;
+  creator.agreement.invitation ||= {};
 
   const legacySubmission =
     creator.reelSubmission && typeof creator.reelSubmission === "object"
@@ -1264,10 +1375,18 @@ function earningsForCreator(creator) {
       0
     )
   );
-  const accountEarnings =
-    Number(creator.metrics.accountsCreated || 0) *
-    Number(creator.accountBonus || 0);
-  const grossEarnings = moneyNumber(reelEarnings + accountEarnings);
+  const downloadEarnings = moneyNumber(
+    Number(creator.metrics.installs || 0) *
+    Number(creator.downloadBonus || 0)
+  );
+  const subscriptionEarnings = moneyNumber(
+    Number(creator.metrics.subscriptions || 0) *
+    Number(creator.subscriptionBonus || 0)
+  );
+  const accountEarnings = 0;
+  const grossEarnings = moneyNumber(
+    reelEarnings + downloadEarnings + subscriptionEarnings
+  );
   const paidEarnings = moneyNumber(creator.metrics.paidEarnings || 0);
   const pendingPayouts = reservedAmountForCreator(creator.code);
   const availableEarnings = moneyNumber(
@@ -1276,9 +1395,9 @@ function earningsForCreator(creator) {
 
   return {
     reelEarnings,
-    accountEarnings: moneyNumber(accountEarnings),
-    // Downloads remain analytics only. Legacy value is always zero.
-    downloadEarnings: 0,
+    accountEarnings,
+    downloadEarnings,
+    subscriptionEarnings,
     grossEarnings,
     paidEarnings,
     pendingPayouts,
@@ -1381,8 +1500,17 @@ function creatorView(creator, includePrivate = false) {
       activeOpportunity: creator.reelProgram.activeOpportunity || null,
     },
     accountBonus: moneyNumber(creator.accountBonus),
-    // Deprecated compatibility alias; compensation is based on accounts created.
-    downloadBonus: moneyNumber(creator.accountBonus),
+    downloadBonus: moneyNumber(creator.downloadBonus),
+    subscriptionBonus: moneyNumber(creator.subscriptionBonus),
+    agreement: {
+      version: creator.agreement?.version || CREATOR_AGREEMENT_VERSION,
+      status: creator.agreement?.status || "not_started",
+      ownerSignedAt: creator.agreement?.ownerSignedAt || null,
+      ownerSignerName: creator.agreement?.ownerSignerName || null,
+      creatorSignedAt: creator.agreement?.creatorSignedAt || null,
+      creatorSignerName: creator.agreement?.creatorSignerName || null,
+      terms: creatorAgreementTerms(creator),
+    },
     minimumPayout: MIN_PAYOUT,
     payoutEstimate: {
       minBusinessDays: PAYOUT_ESTIMATE_MIN_DAYS,
@@ -3356,14 +3484,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     }
 
     const code = uniqueCode(requestedCode);
-    const accessKey = crypto.randomBytes(12).toString("base64url");
     const timestamp = nowISO();
 
     const creator = ensureCreatorShape({
       code,
       name,
       email,
-      status: "active",
+      status: "pending_owner_signature",
       campaignUrl: String(req.body?.campaignUrl || "").trim() || null,
       reelFee: Math.max(0, moneyNumber(req.body?.reelFee)),
       reelCompleted: false,
@@ -3374,15 +3501,27 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         nextRequest: null,
         activeOpportunity: null,
       },
-      accountBonus: Math.max(
+      accountBonus: 0,
+      downloadRate: Math.max(
         0,
-        moneyNumber(
-          req.body?.accountBonus ??
-          req.body?.downloadBonus ??
-          DEFAULT_ACCOUNT_BONUS
-        )
+        moneyNumber(req.body?.downloadRate ?? req.body?.downloadBonus ?? DEFAULT_DOWNLOAD_BONUS)
       ),
-      accessKeyHash: hashSecret(accessKey),
+      subscriptionRate: Math.max(
+        0,
+        moneyNumber(req.body?.subscriptionRate ?? req.body?.subscriptionBonus ?? DEFAULT_SUBSCRIPTION_BONUS)
+      ),
+      agreement: {
+        version: CREATOR_AGREEMENT_VERSION,
+        status: "pending_owner_signature",
+        ownerSignedAt: null,
+        ownerSignerName: null,
+        creatorSignedAt: null,
+        creatorSignerName: null,
+        tokenHash: null,
+        tokenIssuedAt: null,
+        invitation: {},
+      },
+      accessKeyHash: null,
       notes: String(req.body?.notes || "").trim(),
       cashApp: {
         cashtag: null,
@@ -3428,27 +3567,163 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     store.creators[code] = creator;
     await persist();
 
-    const invitationEmail = await sendCreatorInvitation(creator, accessKey);
-
-    if (invitationEmail.sent) {
-      creator.invitation.delivery = "sent";
-      creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
-      creator.invitation.lastMessageId = invitationEmail.messageId || null;
-      creator.invitation.lastError = null;
-      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
-    } else {
-      creator.invitation.delivery = invitationEmail.configured ? "failed" : "not_configured";
-      creator.invitation.lastError = invitationEmail.error || null;
-    }
-
-    creator.updatedAt = nowISO();
-    await persist();
-
     return res.status(201).json({
       ok: true,
       creator: creatorView(creator, true),
-      accessKey,
+      accessKey: null,
+      invitationEmail: {
+        sent: false,
+        pendingAgreement: true,
+        reason: "Owner signature required before creator invitation",
+      },
+    });
+  });
+
+  router.post("/admin/creators/:code/agreement/owner-sign", requireAdmin, async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+    if (!creator) return res.status(404).json({ error: "Creator not found" });
+
+    ensureCreatorShape(creator);
+    const signerName = String(req.body?.signerName || "").trim();
+    const accepted = req.body?.accepted === true;
+
+    if (!accepted || signerName.length < 2) {
+      return res.status(400).json({
+        error: "Owner legal name and agreement acceptance are required",
+      });
+    }
+
+    if (creator.agreement?.creatorSignedAt) {
+      return res.status(409).json({ error: "Agreement is already fully signed" });
+    }
+
+    const token = crypto.randomBytes(24).toString("base64url");
+    creator.agreement.version = CREATOR_AGREEMENT_VERSION;
+    creator.agreement.status = "pending_creator_signature";
+    creator.agreement.ownerSignedAt = creator.agreement.ownerSignedAt || nowISO();
+    creator.agreement.ownerSignerName = creator.agreement.ownerSignerName || signerName;
+    creator.agreement.tokenHash = hashSecret(token);
+    creator.agreement.tokenIssuedAt = nowISO();
+    creator.status = "pending_creator_signature";
+    creator.updatedAt = nowISO();
+    await persist();
+
+    const agreementEmail = await sendCreatorAgreementRequest(creator, token);
+    creator.agreement.invitation = {
+      delivery: agreementEmail.sent
+        ? "sent"
+        : (agreementEmail.configured ? "failed" : "not_configured"),
+      lastSentAt: agreementEmail.sentAt || null,
+      lastMessageId: agreementEmail.messageId || null,
+      lastError: agreementEmail.error || null,
+    };
+    creator.updatedAt = nowISO();
+    await persist();
+
+    return res.json({
+      ok: true,
+      creator: creatorView(creator, true),
+      agreementEmail,
+    });
+  });
+
+  router.get("/agreement/:code", async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+    const token = String(req.query?.token || "");
+
+    if (
+      !creator ||
+      !token ||
+      !creator.agreement?.tokenHash ||
+      !safeEqualHex(hashSecret(token), creator.agreement.tokenHash)
+    ) {
+      return res.status(404).json({ error: "Agreement link is invalid or expired" });
+    }
+
+    return res.json({
+      ok: true,
+      agreement: {
+        creatorCode: creator.code,
+        creatorName: creator.name,
+        version: creator.agreement.version,
+        company: "Nova Prime LLC",
+        ownerSignedAt: creator.agreement.ownerSignedAt,
+        ownerSignerName: creator.agreement.ownerSignerName,
+        creatorSignedAt: creator.agreement.creatorSignedAt,
+        status: creator.agreement.status,
+        terms: creatorAgreementTerms(creator),
+        summary: creatorAgreementSummaryLines(creator),
+      },
+    });
+  });
+
+  router.post("/agreement/:code/sign", async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+    const token = String(req.body?.token || "");
+    const signerName = String(req.body?.signerName || "").trim();
+    const accepted = req.body?.accepted === true;
+
+    if (
+      !creator ||
+      !token ||
+      !creator.agreement?.tokenHash ||
+      !safeEqualHex(hashSecret(token), creator.agreement.tokenHash)
+    ) {
+      return res.status(404).json({ error: "Agreement link is invalid or expired" });
+    }
+    if (!creator.agreement.ownerSignedAt) {
+      return res.status(409).json({ error: "Owner signature is required first" });
+    }
+    if (!accepted || signerName.length < 2) {
+      return res.status(400).json({
+        error: "Your legal name and agreement acceptance are required",
+      });
+    }
+
+    if (creator.agreement.creatorSignedAt) {
+      return res.status(409).json({ error: "Agreement is already signed" });
+    }
+
+    creator.agreement.creatorSignedAt = nowISO();
+    creator.agreement.creatorSignerName = signerName;
+    creator.agreement.status = "signed";
+    creator.agreement.tokenHash = null;
+    creator.status = "active";
+
+    const accessKey = crypto.randomBytes(12).toString("base64url");
+    creator.accessKeyHash = hashSecret(accessKey);
+    creator.updatedAt = nowISO();
+    await persist();
+
+    const invitationEmail = await sendCreatorInvitation(creator, accessKey);
+    creator.invitation ||= {};
+    creator.invitation.delivery = invitationEmail.sent
+      ? "sent"
+      : (invitationEmail.configured ? "failed" : "not_configured");
+    creator.invitation.lastSentAt = invitationEmail.sentAt || null;
+    creator.invitation.lastMessageId = invitationEmail.messageId || null;
+    creator.invitation.lastError = invitationEmail.error || null;
+    if (invitationEmail.sent) {
+      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
+    }
+    creator.updatedAt = nowISO();
+    await persist();
+
+    return res.json({
+      ok: true,
+      signed: true,
       invitationEmail,
+      accessKey: invitationEmail.sent ? null : accessKey,
+      creatorPortal: CREATOR_PORTAL_URL,
     });
   });
 
@@ -3493,6 +3768,14 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       if (!["active", "paused"].includes(status)) {
         return res.status(400).json({ error: "Status must be active or paused" });
       }
+      if (
+        status === "active" &&
+        !["signed", "legacy_active"].includes(creator.agreement?.status)
+      ) {
+        return res.status(409).json({
+          error: "Creator cannot be activated until the collaboration agreement is signed by both parties",
+        });
+      }
       creator.status = status;
     }
 
@@ -3504,15 +3787,20 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       creator.reelFee = Math.max(0, moneyNumber(req.body.reelFee));
     }
 
-    if (
-      req.body?.accountBonus !== undefined ||
-      req.body?.downloadBonus !== undefined
-    ) {
-      creator.accountBonus = Math.max(
+    if (req.body?.downloadRate !== undefined || req.body?.downloadBonus !== undefined) {
+      creator.downloadBonus = Math.max(
         0,
-        moneyNumber(req.body?.accountBonus ?? req.body?.downloadBonus)
+        moneyNumber(req.body?.downloadRate ?? req.body?.downloadBonus)
       );
-      creator.downloadBonus = creator.accountBonus;
+      creator.downloadRate = creator.downloadBonus;
+    }
+
+    if (req.body?.subscriptionRate !== undefined || req.body?.subscriptionBonus !== undefined) {
+      creator.subscriptionBonus = Math.max(
+        0,
+        moneyNumber(req.body?.subscriptionRate ?? req.body?.subscriptionBonus)
+      );
+      creator.subscriptionRate = creator.subscriptionBonus;
     }
 
     if (req.body?.reelCompleted !== undefined) {
@@ -3944,6 +4232,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
         return res.status(404).json({ error: "Creator not found" });
       }
 
+      ensureCreatorShape(creator);
+      if (creator.status !== "active" || !["signed", "legacy_active"].includes(creator.agreement?.status)) {
+        return res.status(409).json({
+          error: "Creator credentials cannot be sent until the collaboration agreement is fully signed",
+        });
+      }
+
       if (!creatorEmailConfigured()) {
         return res.status(503).json({
           error: "Creator email delivery is not configured",
@@ -4002,6 +4297,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
 
       if (!creator) {
         return res.status(404).json({ error: "Creator not found" });
+      }
+
+      ensureCreatorShape(creator);
+      if (creator.status !== "active" || !["signed", "legacy_active"].includes(creator.agreement?.status)) {
+        return res.status(409).json({
+          error: "Access keys cannot be created until the collaboration agreement is fully signed",
+        });
       }
 
       const accessKey = crypto.randomBytes(12).toString("base64url");
