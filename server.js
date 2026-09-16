@@ -17,7 +17,7 @@ import { createTaxRouter } from "./taxRouter.js";
 import { createOrderScanUsageStore, createUniversalOrderScanRouter } from "./universalOrderScanRouter.js";
 import { createEventRouter } from "./eventRouter.js";
 import { createDriverMapRouter } from "./driverMapRouter.js";
-import { createReferralRouter } from "./referrals.js";
+import { createReferralRouter, recordReferralSubscriptionForUid } from "./referrals.js";
 import { interpretTrustedEventRange, resolveTrustedTimeContext } from "./trustedTime.js";
 import {
   createGooglePlaySubscriptionVerifier,
@@ -1302,11 +1302,23 @@ app.post("/subscription/sync", requireFirebaseAuth, async (req, res) => {
         subscriptionUpdatedAt: now,
       }, { merge: true });
 
+      let referralCredit = null;
+      try {
+        referralCredit = await recordReferralSubscriptionForUid(req.auth.uid);
+      } catch (referralError) {
+        console.error("Referral subscription credit failed", {
+          uid: req.auth.uid,
+          provider: "google_play",
+          message: referralError?.message || String(referralError),
+        });
+      }
+
       return res.json({
         ok: true,
         plan: verified.plan,
         productId: verified.productId,
         expiresAt: verified.expiryTime,
+        referralSubscriptionCounted: Boolean(referralCredit?.counted),
       });
     } catch (error) {
       console.error("Google Play subscription verification failed", {
@@ -1367,6 +1379,19 @@ app.post("/subscription/sync", requireFirebaseAuth, async (req, res) => {
       verified,
     });
 
+    let referralCredit = null;
+    if (verified.status === "active" && verified.plan !== "free") {
+      try {
+        referralCredit = await recordReferralSubscriptionForUid(req.auth.uid);
+      } catch (referralError) {
+        console.error("Referral subscription credit failed", {
+          uid: req.auth.uid,
+          provider: "storekit",
+          message: referralError?.message || String(referralError),
+        });
+      }
+    }
+
     return res.json({
       ok: true,
       plan: verified.status === "active" ? verified.plan : "free",
@@ -1375,6 +1400,7 @@ app.post("/subscription/sync", requireFirebaseAuth, async (req, res) => {
       originalTransactionId: verified.originalTransactionId,
       ownership: ownership.claimed ? "claimed" : "owned",
       status: verified.status,
+      referralSubscriptionCounted: Boolean(referralCredit?.counted),
     });
   } catch (error) {
     console.error("Subscription entitlement sync failed", {
