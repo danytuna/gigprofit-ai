@@ -3887,6 +3887,57 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     });
   });
 
+  router.delete("/admin/creators/:code", requireAdmin, async (req, res) => {
+    await ensureLoaded();
+
+    const code = slugify(req.params.code);
+    const creator = store.creators[code];
+
+    if (!creator) {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    ensureCreatorShape(creator);
+
+    const blockingStatuses = new Set([
+      "requested",
+      "approved",
+      "funding",
+      "processing",
+    ]);
+    const blockingPayouts = creatorPayouts(code).filter((payout) =>
+      blockingStatuses.has(payout.status)
+    );
+
+    if (blockingPayouts.length) {
+      return res.status(409).json({
+        error: "Resolve the creator's pending payout before deleting the creator",
+        code: "CREATOR_HAS_PENDING_PAYOUT",
+        payouts: blockingPayouts.map(payoutView),
+      });
+    }
+
+    let removedAttributions = 0;
+    for (const [key, attribution] of Object.entries(store.accountAttributions || {})) {
+      if (attribution?.creatorCode === code) {
+        delete store.accountAttributions[key];
+        removedAttributions += 1;
+      }
+    }
+
+    delete store.creators[code];
+    await persist();
+
+    return res.json({
+      ok: true,
+      deleted: true,
+      code,
+      email: creator.email || null,
+      removedAttributions,
+      historicalPayoutsRetained: creatorPayouts(code).length,
+    });
+  });
+
   router.post(
     "/admin/creators/:code/reels/:reelId/approve",
     requireAdmin,
