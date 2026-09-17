@@ -17,7 +17,7 @@ import { createTaxRouter } from "./taxRouter.js";
 import { createOrderScanUsageStore, createUniversalOrderScanRouter } from "./universalOrderScanRouter.js";
 import { createEventRouter } from "./eventRouter.js";
 import { createDriverMapRouter } from "./driverMapRouter.js";
-import { createReferralRouter, recordReferralSubscriptionForUid } from "./referrals.js";
+import { createReferralRouter, recordReferralSubscriptionForUid, getCreatorMailer } from "./referrals.js";
 import { interpretTrustedEventRange, resolveTrustedTimeContext } from "./trustedTime.js";
 import {
   createGooglePlaySubscriptionVerifier,
@@ -125,6 +125,59 @@ app.use(
   "/referrals",
   createReferralRouter({ requireFirebaseAuth })
 );
+
+// TEMPORARY DIAGNOSTIC ENDPOINT — verifies SMTP connectivity for the
+// creator program mailer without sending mail. Not documented, no auth.
+// Remove once the root cause of creator email delivery failures is fixed.
+app.get("/test-smtp-verify", async (_req, res) => {
+  try {
+    const mailer = getCreatorMailer();
+
+    if (!mailer) {
+      return res.json({
+        configured: false,
+        message: "Creator email not configured",
+      });
+    }
+
+    try {
+      await mailer.verify();
+      return res.json({
+        success: true,
+        message: "SMTP connection verified",
+      });
+    } catch (verifyError) {
+      const code = verifyError?.code || verifyError?.responseCode || "UNKNOWN";
+      let message = "SMTP verification failed";
+
+      if (code === 535 || code === "535") {
+        message = "SMTP authentication failed";
+      } else if (code === "ECONNREFUSED") {
+        message = "Connection refused";
+      } else if (code === "ETIMEDOUT") {
+        message = "Connection timed out";
+      } else if (
+        typeof code === "string" &&
+        code.startsWith("ERR_TLS")
+      ) {
+        message = "TLS handshake failed";
+      }
+
+      return res.json({
+        success: false,
+        code: String(code),
+        message,
+      });
+    }
+  } catch (error) {
+    return res.json({
+      success: false,
+      code: "UNKNOWN",
+      message: "Unexpected error during SMTP verification",
+    });
+  }
+});
+
 const requireProSubscription = createCanonicalPlanAuthorizer({
   firestore: firebaseAdminServices.firestore,
   requiredPlan: "pro",
