@@ -276,7 +276,7 @@ function creatorEmailConfigured() {
   );
 }
 
-function getCreatorMailer() {
+export function getCreatorMailer() {
   if (!creatorEmailConfigured()) return null;
   if (creatorMailer) return creatorMailer;
 
