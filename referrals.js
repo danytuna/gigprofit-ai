@@ -269,6 +269,30 @@ function creatorAgreementSummaryLines(creator) {
   ];
 }
 
+function redactSecrets(value) {
+  return String(value ?? "")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[EMAIL]")
+    .replace(
+      /\b(pass(word)?|pwd|secret|key)\s*[:=]\s*\S+/gi,
+      (_match, label) => `${label}: [REDACTED]`
+    );
+}
+
+function smtpErrorHint(code) {
+  switch (code) {
+    case "EAUTH":
+      return "Authentication failed — verify SMTP credentials (Gmail requires App Password)";
+    case "ECONNREFUSED":
+      return "Connection refused — verify SMTP host and port are reachable";
+    case "ETIMEDOUT":
+      return "Connection timed out — check network/firewall access to the SMTP host and port";
+    case "MISSING_CREDENTIALS":
+      return "SMTP credentials are not configured";
+    default:
+      return "Unable to verify SMTP connection — check host, port, and credentials";
+  }
+}
+
 function creatorEmailConfigured() {
   return Boolean(
     String(process.env.CREATOR_EMAIL_SMTP_USER || "").trim() &&
@@ -2910,6 +2934,61 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       storage: DATA_PATH,
       contact: CONTACT_EMAIL,
     });
+  });
+
+  router.get("/test-smtp", async (_req, res) => {
+    const config = {
+      host: CREATOR_EMAIL_SMTP_HOST,
+      port: CREATOR_EMAIL_SMTP_PORT,
+      secure: CREATOR_EMAIL_SMTP_PORT === 465
+        ? true
+        : CREATOR_EMAIL_SMTP_PORT === 587
+          ? false
+          : CREATOR_EMAIL_SMTP_SECURE,
+    };
+
+    if (!creatorEmailConfigured()) {
+      return res.status(503).json({
+        status: "FAILURE",
+        code: "MISSING_CREDENTIALS",
+        message: "Creator email delivery is not configured",
+        config,
+        hint: "Set CREATOR_EMAIL_SMTP_USER and CREATOR_EMAIL_SMTP_PASS",
+      });
+    }
+
+    const mailer = getCreatorMailer();
+
+    if (!mailer) {
+      return res.status(503).json({
+        status: "FAILURE",
+        code: "MISSING_CREDENTIALS",
+        message: "Creator email delivery is not configured",
+        config,
+        hint: "Set CREATOR_EMAIL_SMTP_USER and CREATOR_EMAIL_SMTP_PASS",
+      });
+    }
+
+    try {
+      await mailer.verify();
+
+      return res.json({
+        status: "SUCCESS",
+        message: "SMTP connection verified",
+        config,
+      });
+    } catch (error) {
+      const code = error?.code || "UNKNOWN";
+      const message = redactSecrets(error?.message || String(error));
+
+      return res.status(502).json({
+        status: "FAILURE",
+        code,
+        message,
+        config,
+        hint: smtpErrorHint(code),
+      });
+    }
   });
 
   router.post("/click/:code", async (req, res) => {
