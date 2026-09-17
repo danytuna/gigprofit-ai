@@ -3672,6 +3672,8 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     creator.updatedAt = nowISO();
     await persist();
 
+    const agreementUrl =
+      `${CREATOR_PORTAL_URL}?agreement=${encodeURIComponent(creator.code)}&token=${encodeURIComponent(token)}`;
     const agreementEmail = await sendCreatorAgreementRequest(creator, token);
     creator.agreement.invitation = {
       delivery: agreementEmail.sent
@@ -3688,6 +3690,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       ok: true,
       creator: creatorView(creator, true),
       agreementEmail,
+      agreementUrl,
     });
   });
 
@@ -3783,7 +3786,12 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       ok: true,
       signed: true,
       invitationEmail,
-      accessKey: invitationEmail.sent ? null : accessKey,
+      accessKey,
+      creator: {
+        code: creator.code,
+        email: creator.email,
+        name: creator.name,
+      },
       creatorPortal: CREATOR_PORTAL_URL,
     });
   });
