@@ -4353,53 +4353,58 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       }
 
       ensureCreatorShape(creator);
-      if (creator.status !== "active" || !["signed", "legacy_active"].includes(creator.agreement?.status)) {
+      if (
+        creator.status !== "active" ||
+        !["signed", "legacy_active"].includes(creator.agreement?.status)
+      ) {
         return res.status(409).json({
-          error: "Creator credentials cannot be sent until the collaboration agreement is fully signed",
-        });
-      }
-
-      if (!creatorEmailConfigured()) {
-        return res.status(503).json({
-          error: "Creator email delivery is not configured",
-          requiredEnv: [
-            "CREATOR_EMAIL_SMTP_USER",
-            "CREATOR_EMAIL_SMTP_PASS"
-          ],
+          error:
+            "Creator credentials cannot be sent until the collaboration agreement is fully signed",
         });
       }
 
       const accessKey = crypto.randomBytes(12).toString("base64url");
-      const invitationEmail = await sendCreatorInvitation(creator, accessKey);
 
-      if (!invitationEmail.sent) {
-        creator.invitation ||= {};
-        creator.invitation.delivery = "failed";
-        creator.invitation.lastError = invitationEmail.error || "Email delivery failed";
-        creator.updatedAt = nowISO();
-        await persist();
+      // Rotate the credential first so the owner always has a usable replacement key,
+      // even when email delivery is temporarily unavailable.
+      creator.accessKeyHash = hashSecret(accessKey);
+      creator.updatedAt = nowISO();
+      await persist();
 
-        return res.status(502).json({
-          error: "Unable to send creator login email",
-          details: invitationEmail.error || null,
-        });
+      let invitationEmail = {
+        configured: creatorEmailConfigured(),
+        sent: false,
+        error: null,
+      };
+
+      if (creatorEmailConfigured()) {
+        invitationEmail = await sendCreatorInvitation(creator, accessKey);
+      } else {
+        invitationEmail.error = "Creator email delivery is not configured";
       }
 
-      creator.accessKeyHash = hashSecret(accessKey);
       creator.invitation ||= {};
-      creator.invitation.delivery = "sent";
-      creator.invitation.lastSentAt = invitationEmail.sentAt || nowISO();
+      creator.invitation.delivery = invitationEmail.sent ? "sent" : "failed";
+      creator.invitation.lastSentAt = invitationEmail.sentAt || null;
       creator.invitation.lastMessageId = invitationEmail.messageId || null;
-      creator.invitation.lastError = null;
-      creator.invitation.sendCount = Number(creator.invitation.sendCount || 0) + 1;
+      creator.invitation.lastError = invitationEmail.sent
+        ? null
+        : invitationEmail.error || "Email delivery failed";
+      if (invitationEmail.sent) {
+        creator.invitation.sendCount =
+          Number(creator.invitation.sendCount || 0) + 1;
+      }
       creator.updatedAt = nowISO();
       await persist();
 
       return res.json({
         ok: true,
+        accessKey,
         invitationEmail: {
-          sent: true,
-          sentAt: creator.invitation.lastSentAt,
+          configured: Boolean(invitationEmail.configured),
+          sent: Boolean(invitationEmail.sent),
+          sentAt: invitationEmail.sentAt || null,
+          error: invitationEmail.sent ? null : invitationEmail.error || "Email delivery failed",
         },
         creator: creatorView(creator, true),
       });
@@ -4420,9 +4425,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       }
 
       ensureCreatorShape(creator);
-      if (creator.status !== "active" || !["signed", "legacy_active"].includes(creator.agreement?.status)) {
+      if (
+        creator.status !== "active" ||
+        !["signed", "legacy_active"].includes(creator.agreement?.status)
+      ) {
         return res.status(409).json({
-          error: "Access keys cannot be created until the collaboration agreement is fully signed",
+          error:
+            "Access keys cannot be created until the collaboration agreement is fully signed",
         });
       }
 
@@ -4431,9 +4440,41 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
       creator.updatedAt = nowISO();
       await persist();
 
+      let invitationEmail = {
+        configured: creatorEmailConfigured(),
+        sent: false,
+        error: null,
+      };
+
+      if (creatorEmailConfigured()) {
+        invitationEmail = await sendCreatorInvitation(creator, accessKey);
+      } else {
+        invitationEmail.error = "Creator email delivery is not configured";
+      }
+
+      creator.invitation ||= {};
+      creator.invitation.delivery = invitationEmail.sent ? "sent" : "failed";
+      creator.invitation.lastSentAt = invitationEmail.sentAt || null;
+      creator.invitation.lastMessageId = invitationEmail.messageId || null;
+      creator.invitation.lastError = invitationEmail.sent
+        ? null
+        : invitationEmail.error || "Email delivery failed";
+      if (invitationEmail.sent) {
+        creator.invitation.sendCount =
+          Number(creator.invitation.sendCount || 0) + 1;
+      }
+      creator.updatedAt = nowISO();
+      await persist();
+
       return res.json({
         ok: true,
         accessKey,
+        invitationEmail: {
+          configured: Boolean(invitationEmail.configured),
+          sent: Boolean(invitationEmail.sent),
+          sentAt: invitationEmail.sentAt || null,
+          error: invitationEmail.sent ? null : invitationEmail.error || "Email delivery failed",
+        },
         creator: creatorView(creator, true),
       });
     }
