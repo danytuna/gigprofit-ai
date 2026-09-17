@@ -113,8 +113,9 @@ const CREATOR_EMAIL_SMTP_SECURE =
   ).toLowerCase() === "true";
 
 const CREATOR_EMAIL_FROM =
-  process.env.CREATOR_EMAIL_FROM ||
-  `GigProfit Creator Program <${process.env.CREATOR_EMAIL_SMTP_USER || CONTACT_EMAIL}>`;
+  `GigProfit Creator Program <${String(
+    process.env.CREATOR_EMAIL_SMTP_USER || CONTACT_EMAIL
+  ).trim()}>`;
 
 let creatorMailer = null;
 
@@ -438,6 +439,9 @@ async function sendCreatorInvitation(creator, accessKey) {
       sent: true,
       messageId: info?.messageId || null,
       sentAt: nowISO(),
+      accepted: Array.isArray(info?.accepted) ? info.accepted : [],
+      rejected: Array.isArray(info?.rejected) ? info.rejected : [],
+      smtpResponse: info?.response || null,
     };
   } catch (error) {
     console.error("CREATOR INVITATION EMAIL ERROR:", error);
@@ -498,6 +502,9 @@ async function sendProgramEmail({ to, subject, title, textLines = [], htmlLines 
       sent: true,
       messageId: info?.messageId || null,
       sentAt: nowISO(),
+      accepted: Array.isArray(info?.accepted) ? info.accepted : [],
+      rejected: Array.isArray(info?.rejected) ? info.rejected : [],
+      smtpResponse: info?.response || null,
     };
   } catch (error) {
     console.error("CREATOR PROGRAM EMAIL ERROR:", error);
