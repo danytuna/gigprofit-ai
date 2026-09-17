@@ -18,6 +18,7 @@ import { createOrderScanUsageStore, createUniversalOrderScanRouter } from "./uni
 import { createEventRouter } from "./eventRouter.js";
 import { createDriverMapRouter } from "./driverMapRouter.js";
 import { createReferralRouter, recordReferralSubscriptionForUid } from "./referrals.js";
+import { testSmtpConnection } from "./smtpDiagnostics.js";
 import { interpretTrustedEventRange, resolveTrustedTimeContext } from "./trustedTime.js";
 import {
   createGooglePlaySubscriptionVerifier,
@@ -722,6 +723,27 @@ app.get("/health", (req, res) => {
     service: "gigprofit-ai",
     environment: NODE_ENV,
   });
+});
+
+// --------------------------------------------------
+// ADMIN DIAGNOSTICS
+// --------------------------------------------------
+
+// Diagnostic endpoint for verifying the CREATOR_EMAIL_SMTP_* configuration.
+// Performs a connection/TLS/auth handshake via nodemailer's verify() only —
+// it never sends an email and never returns credential values.
+app.get("/admin/smtp-test", async (req, res) => {
+  try {
+    const result = await testSmtpConnection();
+    res.status(result.success ? 200 : 502).json(result);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      stage: "connect",
+      sanitizedError: "Unexpected error while running SMTP diagnostic",
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 // --------------------------------------------------
