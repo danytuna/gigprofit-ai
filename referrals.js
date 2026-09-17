@@ -280,17 +280,32 @@ function getCreatorMailer() {
   if (!creatorEmailConfigured()) return null;
   if (creatorMailer) return creatorMailer;
 
+  const smtpUser = String(process.env.CREATOR_EMAIL_SMTP_USER || "").trim();
+  const rawSmtpPass = String(process.env.CREATOR_EMAIL_SMTP_PASS || "");
+  const smtpPass = CREATOR_EMAIL_SMTP_HOST.toLowerCase().includes("gmail")
+    ? rawSmtpPass.replace(/\s+/g, "")
+    : rawSmtpPass.trim();
+
+  // Keep Gmail's TLS modes internally consistent even if an old Railway
+  // variable was accidentally set to the wrong secure value.
+  const smtpSecure = CREATOR_EMAIL_SMTP_PORT === 465
+    ? true
+    : CREATOR_EMAIL_SMTP_PORT === 587
+      ? false
+      : CREATOR_EMAIL_SMTP_SECURE;
+
   creatorMailer = nodemailer.createTransport({
     host: CREATOR_EMAIL_SMTP_HOST,
     port: CREATOR_EMAIL_SMTP_PORT,
-    secure: CREATOR_EMAIL_SMTP_SECURE,
+    secure: smtpSecure,
+    requireTLS: CREATOR_EMAIL_SMTP_PORT === 587,
     auth: {
-      user: process.env.CREATOR_EMAIL_SMTP_USER,
-      pass: process.env.CREATOR_EMAIL_SMTP_PASS,
+      user: smtpUser,
+      pass: smtpPass,
     },
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 15_000,
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
   });
 
   return creatorMailer;
