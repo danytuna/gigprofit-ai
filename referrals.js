@@ -311,6 +311,34 @@ function getCreatorMailer() {
   return creatorMailer;
 }
 
+async function verifyCreatorEmailTransport() {
+  if (!creatorEmailConfigured()) {
+    console.warn("CREATOR EMAIL SMTP VERIFY: not configured");
+    return { ok: false, configured: false };
+  }
+
+  try {
+    const mailer = getCreatorMailer();
+    await mailer.verify();
+    console.log("CREATOR EMAIL SMTP VERIFY: ok");
+    return { ok: true, configured: true };
+  } catch (error) {
+    console.error(
+      "CREATOR EMAIL SMTP VERIFY ERROR:",
+      error?.code || "UNKNOWN",
+      error?.responseCode || "",
+      error?.message || String(error)
+    );
+    return {
+      ok: false,
+      configured: true,
+      code: error?.code || null,
+      responseCode: error?.responseCode || null,
+      error: error?.message || String(error),
+    };
+  }
+}
+
 function creatorInvitationMessage(creator, accessKey) {
   const referralUrl =
     `${REFERRAL_BASE_URL}/r/${encodeURIComponent(creator.code)}`;
@@ -2856,6 +2884,7 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
     console.error("REFERRAL STARTUP LOAD ERROR:", error);
   });
   startStripeBackgroundSync();
+  void verifyCreatorEmailTransport();
 
   const requireReferralAccountAuth =
     typeof requireFirebaseAuth === "function"
