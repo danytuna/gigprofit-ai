@@ -434,6 +434,13 @@ async function sendCreatorInvitation(creator, accessKey) {
       html: message.html,
     });
 
+    console.log(
+      "CREATOR INVITATION SMTP RESULT:",
+      `accepted=${Array.isArray(info?.accepted) ? info.accepted.length : 0}`,
+      `rejected=${Array.isArray(info?.rejected) ? info.rejected.length : 0}`,
+      info?.response || ""
+    );
+
     return {
       configured: true,
       sent: true,
@@ -4455,6 +4462,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
           configured: Boolean(invitationEmail.configured),
           sent: Boolean(invitationEmail.sent),
           sentAt: invitationEmail.sentAt || null,
+          accepted: Array.isArray(invitationEmail.accepted)
+            ? invitationEmail.accepted.length
+            : null,
+          rejected: Array.isArray(invitationEmail.rejected)
+            ? invitationEmail.rejected.length
+            : null,
+          smtpResponse: invitationEmail.smtpResponse || null,
           error: invitationEmail.sent ? null : invitationEmail.error || "Email delivery failed",
         },
         creator: creatorView(creator, true),
@@ -4524,6 +4538,13 @@ export function createReferralRouter({ requireFirebaseAuth } = {}) {
           configured: Boolean(invitationEmail.configured),
           sent: Boolean(invitationEmail.sent),
           sentAt: invitationEmail.sentAt || null,
+          accepted: Array.isArray(invitationEmail.accepted)
+            ? invitationEmail.accepted.length
+            : null,
+          rejected: Array.isArray(invitationEmail.rejected)
+            ? invitationEmail.rejected.length
+            : null,
+          smtpResponse: invitationEmail.smtpResponse || null,
           error: invitationEmail.sent ? null : invitationEmail.error || "Email delivery failed",
         },
         creator: creatorView(creator, true),
