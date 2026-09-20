@@ -225,12 +225,84 @@ export function createPlaidRouter({
     const itemId = String(req.body?.item_id || "").trim();
     const maskedItemId = maskItemId(itemId);
 
-    if (webhookType !== "ITEM" || !webhookCode || !itemId) {
+    if (!webhookCode || !itemId) {
       console.info("PLAID WEBHOOK IGNORED", {
         webhook_type: webhookType || null,
         webhook_code: webhookCode || null,
         item_id: maskedItemId,
-        result: "ignored",
+        result: "missing_fields",
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (webhookType === "TRANSACTIONS") {
+      const supportedTransactionCodes = new Set([
+        "INITIAL_UPDATE",
+        "HISTORICAL_UPDATE",
+        "DEFAULT_UPDATE",
+        "TRANSACTIONS_REMOVED",
+      ]);
+
+      if (!supportedTransactionCodes.has(webhookCode)) {
+        console.info("PLAID WEBHOOK IGNORED", {
+          webhook_type: webhookType,
+          webhook_code: webhookCode,
+          item_id: maskedItemId,
+          result: "unsupported_code",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      try {
+        const owner = await store.findItemOwner(itemId);
+        if (!owner) {
+          console.info("PLAID WEBHOOK PROCESSED", {
+            webhook_type: webhookType,
+            webhook_code: webhookCode,
+            item_id: maskedItemId,
+            result: "item_not_found",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const webhookState = {
+          lastWebhookType: webhookType,
+          lastWebhookCode: webhookCode,
+          lastWebhookAt: admin.firestore.FieldValue.serverTimestamp(),
+          transactionsReady: true,
+        };
+
+        if (webhookCode === "HISTORICAL_UPDATE") {
+          webhookState.historicalTransactionsReady = true;
+          webhookState.historicalTransactionsReadyAt = admin.firestore.FieldValue.serverTimestamp();
+        }
+
+        await store.updateItemState(owner.uid, itemId, webhookState);
+        console.info("PLAID WEBHOOK PROCESSED", {
+          webhook_type: webhookType,
+          webhook_code: webhookCode,
+          item_id: maskedItemId,
+          result: "updated",
+        });
+        return res.status(200).json({ ok: true });
+      } catch (error) {
+        console.error("PLAID WEBHOOK ERROR", {
+          webhook_type: webhookType,
+          webhook_code: webhookCode,
+          item_id: maskedItemId,
+          result: "failed",
+          message: error?.message || "Unknown error",
+        });
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    if (webhookType !== "ITEM") {
+      console.info("PLAID WEBHOOK IGNORED", {
+        webhook_type: webhookType,
+        webhook_code: webhookCode,
+        item_id: maskedItemId,
+        result: "unsupported_type",
       });
       return res.status(200).json({ ok: true });
     }
@@ -480,8 +552,10 @@ export function createPlaidRouter({
               access_token: accessToken,
               start_date: range.startDate,
               end_date: range.endDate,
-              count: pageSize,
-              offset,
+              options: {
+                count: pageSize,
+                offset,
+              },
             });
 
             const pageTransactions = response.data.transactions || [];
@@ -498,6 +572,14 @@ export function createPlaidRouter({
               break;
             }
           }
+
+          console.info("PLAID TRANSACTIONS FETCHED", {
+            item_id: maskItemId(item.itemId),
+            start_date: range.startDate,
+            end_date: range.endDate,
+            transactions: allTransactions.length,
+            reported_total: Number.isFinite(totalTransactions) ? totalTransactions : allTransactions.length,
+          });
 
           return {
             item,
