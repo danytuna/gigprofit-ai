@@ -89,6 +89,10 @@ function buildReviewDocRef(firestore, uid, reviewId) {
 }
 
 function normalizeTransactionRecord(record = {}) {
+  const transactionType = ["income", "expense", "transfer", "refund"].includes(record.transactionType)
+    ? record.transactionType
+    : record.isIncome ? "income" : record.classification === "excluded" ? "transfer" : "expense";
+
   return {
     id: String(record.id || record.plaidTransactionId || ""),
     plaidTransactionId: String(record.plaidTransactionId || record.id || ""),
@@ -118,10 +122,8 @@ function normalizeTransactionRecord(record = {}) {
     createdAt: normalizeDateValue(record.createdAt, nowIso()),
     updatedAt: normalizeDateValue(record.updatedAt, nowIso()),
     schemaVersion: Number(record.schemaVersion || 1),
-    isIncome: Boolean(record.isIncome),
-    transactionType: ["income", "expense", "transfer", "refund"].includes(record.transactionType)
-      ? record.transactionType
-      : record.isIncome ? "income" : record.classification === "excluded" ? "transfer" : "expense",
+    isIncome: transactionType === "income",
+    transactionType,
     reviewId: record.reviewId || null,
     flags: Array.isArray(record.flags) ? record.flags : [],
     merchantKey: record.merchantKey || null,
@@ -188,6 +190,11 @@ function normalizeReviewRecord(review = {}) {
     transactionSetHash: review.transactionSetHash || null,
     sourceYear: Number.isFinite(Number(review.sourceYear)) ? Number(review.sourceYear) : null,
     sourceAccountCount: Number.isFinite(Number(review.sourceAccountCount)) ? Number(review.sourceAccountCount) : null,
+    sourceTransactionCount: Number.isFinite(Number(review.sourceTransactionCount)) ? Number(review.sourceTransactionCount) : null,
+    autoResolvedTransactions: Number.isFinite(Number(review.autoResolvedTransactions)) ? Number(review.autoResolvedTransactions) : 0,
+    aiRequestedTransactions: Number.isFinite(Number(review.aiRequestedTransactions)) ? Number(review.aiRequestedTransactions) : 0,
+    aiCompletedTransactions: Number.isFinite(Number(review.aiCompletedTransactions)) ? Number(review.aiCompletedTransactions) : 0,
+    aiFailedTransactions: Number.isFinite(Number(review.aiFailedTransactions)) ? Number(review.aiFailedTransactions) : 0,
     heartbeatAt: normalizeDateValue(review.heartbeatAt, normalizeDateValue(review.updatedAt, nowIso())),
     reusedExistingReview: Boolean(review.reusedExistingReview),
     summary: review.summary || {},

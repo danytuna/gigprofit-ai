@@ -323,8 +323,14 @@ export function createPlaidRouter({
         },
         client_name: "GigProfit",
         products: ["transactions"],
+        transactions: {
+          // Taxes need the full tax year even when the bank is connected late in the year.
+          // Plaid defaults to 90 days unless this is explicitly requested at Item creation.
+          days_requested: 730,
+        },
         country_codes: ["US"],
         language: "en",
+        ...(plaidWebhookUrl ? { webhook: plaidWebhookUrl } : {}),
         ...(platform === "android"
           ? { android_package_name: androidPackageName }
           : {}),

@@ -4,6 +4,7 @@ const DEFAULT_MODEL = "gpt-4.1-mini";
 const REVIEW_STATUS = {
   PREPARING: "preparing",
   PROCESSING: "processing",
+  PAUSED: "paused",
   COMPLETED: "completed",
   FAILED: "failed",
   CANCELLED: "cancelled",
@@ -106,12 +107,16 @@ function vehicleSignalLevel(combined, category) {
 }
 
 function buildSafeAiTransaction(transaction) {
+  const amount = Number(transaction.amount || 0);
   return {
     id: transaction.id,
     merchant: transaction.merchantName || transaction.originalName,
-    amount: transaction.amount,
+    originalName: transaction.originalName || null,
+    amount,
+    direction: amount < 0 ? "inflow" : amount > 0 ? "outflow" : "zero",
     date: transaction.date,
-    plaidCategory: transaction.detailedCategory || transaction.primaryCategory || null,
+    plaidPrimaryCategory: transaction.primaryCategory || null,
+    plaidDetailedCategory: transaction.detailedCategory || null,
     recurring: Boolean(transaction.recurring),
     pending: Boolean(transaction.pending),
     isIncome: Boolean(transaction.isIncome),
@@ -140,7 +145,7 @@ function buildSuggestion({
   source = null,
 }) {
   const resolvedTransactionType = transactionType || (
-    transaction.isIncome ? "income" : classification === "excluded" ? "transfer" : "expense"
+    classification === "excluded" ? "transfer" : "expense"
   );
   return {
     transactionId: transaction.id,
@@ -194,24 +199,134 @@ function deterministicSuggestion(transaction, rules = []) {
     });
   }
 
-  if (transaction.isIncome || Number(transaction.amount) < 0) {
+  const amount = Number(transaction.amount || 0);
+  const isInflow = amount < 0;
+  const normalizedCategory = category.replace(/[_-]+/g, " ");
+
+  // Cross-account reconciliation is stronger evidence than a merchant/category guess.
+  if (transaction.internalTransferMatch) {
     return buildSuggestion({
       transaction,
-      classification: "business",
+      classification: "excluded",
       deductibility: "not_deductible",
-      taxCategory: "Income",
-      confidence: 0.98,
-      reason: "Income is reportable but is not a deductible expense.",
+      taxCategory: "Internal transfer",
+      confidence: 0.999,
+      reason: "Matched to an equal and opposite movement in another connected account.",
       requiresUserReview: false,
-      flags: ["income_detected"],
+      flags: ["matched_internal_transfer"],
       classificationSource: "imported",
+      transactionType: "transfer",
     });
   }
 
-  if (includesAny(combined, [
-    "payment thank you", "credit card payment", "autopay", "online payment",
-    "transfer", "zelle", "venmo", "cash app", "paypal transfer",
-  ])) {
+  const refundSignals = [
+    "refund", "reversal", "reversed", "purchase return", "returned purchase",
+    "merchant credit", "cashback", "cash back", "rebate", "tax refund",
+  ];
+  const loanSignals = [
+    "cash advance", "loan", "loan proceeds", "loan disbursement", "loan deposit",
+    "borrow", "borrowed", "advance deposit", "line of credit advance",
+    "earnin", "moneylion", "brigit", "cleo cash advance", "dave advance",
+  ];
+  const strongTransferSignals = [
+    "transfer from checking", "transfer from savings", "transfer to checking",
+    "transfer to savings", "online transfer from", "online transfer to",
+    "account transfer", "internal transfer", "bank transfer",
+    "payment thank you", "credit card payment", "card payment", "autopay payment",
+  ];
+  const peerToPeerSignals = ["zelle", "venmo", "cash app", "paypal"];
+  const payrollSignals = [
+    "payroll", "salary", "paycheck", "direct deposit payroll", "direct dep payroll",
+    "wages", "employer deposit",
+  ];
+  const gigIncomeSignals = [
+    "uber", "lyft", "doordash", "door dash", "grubhub", "instacart",
+    "amazon flex", "spark driver", "walmart spark", "roadie", "shipt",
+  ];
+  const categoryLooksLikeRefund = normalizedCategory.includes("refund") || normalizedCategory.includes("cashback");
+  const categoryLooksLikeTransfer = normalizedCategory.includes("transfer") || normalizedCategory.includes("credit card payment");
+  const categoryLooksLikeIncome = normalizedCategory.includes("income") && !categoryLooksLikeRefund;
+  const categoryLooksLikeStrongIncome = categoryLooksLikeIncome && !normalizedCategory.includes("other income");
+
+  // IMPORTANT: an inflow is only a direction. It is not automatically taxable income.
+  if (isInflow) {
+    if (categoryLooksLikeRefund || includesAny(combined, refundSignals)) {
+      return buildSuggestion({
+        transaction,
+        classification: "excluded",
+        deductibility: "not_deductible",
+        taxCategory: "Refund or reversal",
+        confidence: 0.995,
+        reason: "This credit appears to reverse or refund a prior payment rather than create new income.",
+        requiresUserReview: false,
+        flags: ["refund_like"],
+        classificationSource: "imported",
+        transactionType: "refund",
+      });
+    }
+
+    if (includesAny(combined, loanSignals)) {
+      return buildSuggestion({
+        transaction,
+        classification: "excluded",
+        deductibility: "not_deductible",
+        taxCategory: "Loan or cash advance",
+        confidence: 0.99,
+        reason: "Loan proceeds and cash advances are cash inflows, not earned income.",
+        requiresUserReview: false,
+        flags: ["loan_proceeds"],
+        classificationSource: "imported",
+        transactionType: "transfer",
+      });
+    }
+
+    if (categoryLooksLikeTransfer || includesAny(combined, strongTransferSignals)) {
+      return buildSuggestion({
+        transaction,
+        classification: "excluded",
+        deductibility: "not_deductible",
+        taxCategory: "Transfer",
+        confidence: 0.995,
+        reason: "This credit appears to move existing money rather than create new income.",
+        requiresUserReview: false,
+        flags: ["transfer_like"],
+        classificationSource: "imported",
+        transactionType: "transfer",
+      });
+    }
+
+    // P2P services can carry either business income or ordinary transfers. Category labels
+    // alone are not enough to promote them into taxable income.
+    if (includesAny(combined, peerToPeerSignals) && !includesAny(combined, gigIncomeSignals) && !includesAny(combined, payrollSignals)) {
+      return null;
+    }
+
+    if (categoryLooksLikeStrongIncome || includesAny(combined, payrollSignals) || includesAny(combined, gigIncomeSignals)) {
+      return buildSuggestion({
+        transaction,
+        classification: "business",
+        deductibility: "not_deductible",
+        taxCategory: includesAny(combined, gigIncomeSignals) ? "Gig income" : "Income",
+        confidence: categoryLooksLikeStrongIncome || includesAny(combined, payrollSignals) ? 0.99 : 0.96,
+        reason: "The bank category and/or descriptor provides strong evidence that this credit is earned income.",
+        requiresUserReview: false,
+        flags: ["income_detected"],
+        classificationSource: "imported",
+        transactionType: "income",
+      });
+    }
+
+    // Generic OTHER_INCOME and unknown ACH credits still need contextual review.
+    if (categoryLooksLikeIncome) {
+      return null;
+    }
+
+    return null;
+  }
+
+  // Outgoing card payments and obvious account transfers are not new deductible expenses.
+  // P2P outflows are intentionally left for AI because they may represent a real business purchase.
+  if (categoryLooksLikeTransfer || includesAny(combined, strongTransferSignals)) {
     return buildSuggestion({
       transaction,
       classification: "excluded",
@@ -222,6 +337,7 @@ function deterministicSuggestion(transaction, rules = []) {
       requiresUserReview: false,
       flags: ["transfer_like"],
       classificationSource: "imported",
+      transactionType: "transfer",
     });
   }
 
@@ -467,15 +583,20 @@ function buildTaxReviewInput(transactions) {
             "Return only the structured output requested.",
             "Keep reasons short, practical, and under 160 characters.",
             "Never invent transaction IDs.",
-            "GigProfit uses a strict vehicle-expense-only policy.",
-            "Business categories allowed: confirmed fuel/charging, repair or maintenance shops, automotive parts stores, DMV/registration/inspection, vehicle insurance, car wash/detailing, tolls, work parking, tires, oil service, batteries, towing, and roadside assistance.",
-            "Everything outside those supported vehicle categories must be personal and not_deductible.",
-            "Use needs_review only when the merchant plausibly belongs to one of the supported vehicle categories but cannot be confirmed.",
+            "Determine transactionType before deciding tax classification.",
+            "Plaid amount semantics: a negative amount is money entering the account (inflow); a positive amount is money leaving the account (outflow). An inflow is NOT automatically income.",
+            "For inflows, distinguish earned income from internal/account transfers, credit-card payments, refunds/reversals, loan proceeds/cash advances, and ambiguous P2P/ACH credits.",
+            "Only use transactionType=income when the descriptor/category provides strong evidence of salary, payroll, gig-platform payout, or other earned/reportable income.",
+            "Loan proceeds, cash advances, own-account transfers, card payments, and refunds are not income. Use transfer or refund as appropriate.",
+            "If an inflow could be either income or a transfer and evidence is insufficient, use classification=needs_review, transactionType=transfer, taxCategory=Unclassified inflow, and require user review. Never guess income.",
+            "For expenses, GigProfit uses a strict vehicle-expense-only policy.",
+            "Business expense categories allowed: confirmed fuel/charging, repair or maintenance shops, automotive parts stores, DMV/registration/inspection, vehicle insurance, car wash/detailing, tolls, work parking, tires, oil service, batteries, towing, and roadside assistance.",
+            "Everything outside those supported vehicle expense categories must be personal and not_deductible.",
+            "Use needs_review for expenses only when the merchant plausibly belongs to one of the supported vehicle categories but cannot be confirmed.",
             "For an ambiguous vehicle merchant, use web search to identify the merchant. If identity still cannot be confirmed, keep it in needs_review and add group_by_merchant.",
             "Gas-station descriptors are authoritative: FUEL/PUMP/OUTSIDE is business; INSIDE/STORE/MART/FOOD is personal; unclear descriptors remain needs_review.",
-            "Never classify meals, general retail, phone, subscriptions, home expenses, office supplies, or unrelated merchants as business.",
-            "Review every supplied transaction independently and never infer one transaction from another.",
-            "Do not treat credit-card payments, bank transfers, refunds, cash movements, or loan payments as new deductible expenses.",
+            "Never classify meals, general retail, phone, subscriptions, home expenses, office supplies, or unrelated merchants as business expenses.",
+            "Review every supplied transaction independently and never infer one transaction from another unless an explicit matched-transfer flag is provided.",
             "Respect user notes. If evidence is insufficient, keep the item in needs_review rather than guessing.",
             "Set webLookupUsed and source=aiAndWeb only when a web search was actually used.",
           ].join("\n"),
@@ -624,8 +745,25 @@ function logTaxAiError({ logger, config, phase, attempt, batchSize, error }) {
   return details;
 }
 
+function isQuotaExhaustedTaxAiError(error) {
+  const details = error?.details && typeof error.details === "object"
+    ? error.details
+    : extractOpenAIErrorDetails(error);
+  const code = String(details.code || "").toLowerCase();
+  const type = String(details.type || "").toLowerCase();
+  const message = String(details.message || "").toLowerCase();
+  return code === "credit_balance_exhausted" ||
+    code === "insufficient_quota" ||
+    type === "insufficient_quota" ||
+    message.includes("no credits remaining") ||
+    message.includes("insufficient quota");
+}
+
 function isRetryableTaxAiError(error) {
   const details = extractOpenAIErrorDetails(error);
+  if (isQuotaExhaustedTaxAiError(error)) {
+    return false;
+  }
   if ([400, 401, 403].includes(details.status)) {
     return false;
   }
@@ -665,11 +803,35 @@ function validateSuggestionShape(payload) {
     const proposedCategory = typeof item.taxCategory === "string" && item.taxCategory.trim()
       ? item.taxCategory.trim()
       : "Needs professional review";
+    const transactionType = ["income", "expense", "transfer", "refund"].includes(item.transactionType)
+      ? item.transactionType
+      : item.classification === "excluded" ? "transfer" : "expense";
+    const normalizedConfidence = typeof item.confidence === "number"
+      ? Math.max(0, Math.min(1, item.confidence))
+      : 0.5;
+    const uncertainIncome = transactionType === "income" && (
+      normalizedConfidence < 0.92 || item.requiresUserReview !== false
+    );
+    const effectiveTransactionType = uncertainIncome ? "transfer" : transactionType;
     const categoryIsSupported = supportedBusinessCategories.some((term) => proposedCategory.toLowerCase().includes(term));
     const proposedBusiness = item.classification === "business";
-    const strictClassification = proposedBusiness && !categoryIsSupported ? "personal" : item.classification;
-    const strictDeductibility = strictClassification === "personal" ? "not_deductible" : item.deductibility;
-    const strictCategory = strictClassification === "personal" ? "Personal" : proposedCategory;
+    // The strict vehicle-category gate applies only to expenses. Income has a separate
+    // classification path and must not be rewritten to personal merely because its
+    // tax category is not a vehicle expense. Low-confidence income is kept out of totals
+    // until it is confirmed instead of being guessed into reportable income.
+    const strictClassification = uncertainIncome
+      ? "needs_review"
+      : proposedBusiness && effectiveTransactionType === "expense" && !categoryIsSupported
+        ? "personal"
+        : item.classification;
+    const strictDeductibility = uncertainIncome || effectiveTransactionType !== "expense" || strictClassification === "personal"
+      ? "not_deductible"
+      : item.deductibility;
+    const strictCategory = uncertainIncome
+      ? "Unclassified inflow"
+      : strictClassification === "personal" && effectiveTransactionType === "expense"
+        ? "Personal"
+        : proposedCategory;
 
     return {
       transactionId: item.transactionId,
@@ -677,20 +839,16 @@ function validateSuggestionShape(payload) {
       deductibility: strictDeductibility,
       taxCategory: strictCategory,
       businessUsePercentage: item.businessUsePercentage ?? null,
-      confidence: typeof item.confidence === "number"
-        ? Math.max(0, Math.min(1, item.confidence))
-        : 0.5,
+      confidence: normalizedConfidence,
       reason: typeof item.reason === "string" && item.reason.trim()
         ? item.reason.trim().slice(0, 160)
         : "AI suggested a review.",
-      requiresUserReview: item.requiresUserReview !== false,
+      requiresUserReview: uncertainIncome ? true : item.requiresUserReview !== false,
       flags: Array.isArray(item.flags)
         ? item.flags.filter((flag) => typeof flag === "string" && flag.trim()).slice(0, 8)
         : [],
       classificationSource: "ai_suggestion",
-      transactionType: ["income", "expense", "transfer", "refund"].includes(item.transactionType)
-        ? item.transactionType
-        : item.classification === "excluded" ? "transfer" : "expense",
+      transactionType: effectiveTransactionType,
       merchantIdentity: typeof item.merchantIdentity === "string" && item.merchantIdentity.trim()
         ? item.merchantIdentity.trim().slice(0, 120)
         : null,
@@ -828,7 +986,7 @@ function buildReviewSummary(suggestions, config) {
 
 function normalizeReviewPhase(currentPhase, fallback = REVIEW_STATUS.PREPARING) {
   const normalized = String(currentPhase || fallback || REVIEW_STATUS.PREPARING).trim().toLowerCase();
-  if (["preparing", "reviewing", "saving", "finalizing", "completed", "failed", "cancelled"].includes(normalized)) {
+  if (["preparing", "reviewing", "paused", "saving", "finalizing", "completed", "failed", "cancelled"].includes(normalized)) {
     return normalized;
   }
   if (["processing", "queued"].includes(normalized)) {
@@ -840,335 +998,3 @@ function normalizeReviewPhase(currentPhase, fallback = REVIEW_STATUS.PREPARING) 
 function buildProgressPercent({
   processedTransactions,
   totalTransactions,
-  processedBatches,
-  totalBatches,
-  status,
-}) {
-  if (status === REVIEW_STATUS.COMPLETED) {
-    return 100;
-  }
-
-  const transactions = Math.max(0, Number(processedTransactions || 0));
-  const total = Math.max(0, Number(totalTransactions || 0));
-  const batches = Math.max(0, Number(processedBatches || 0));
-  const totalBatchCount = Math.max(0, Number(totalBatches || 0));
-
-  if (total > 0) {
-    return Math.max(0, Math.min(100, Math.round((transactions / total) * 100)));
-  }
-
-  if (totalBatchCount > 0) {
-    return Math.max(0, Math.min(100, Math.round((batches / totalBatchCount) * 100)));
-  }
-
-  return 0;
-}
-
-function buildReviewProgressRecord({
-  id,
-  year,
-  mode,
-  status,
-  currentPhase,
-  processedTransactions,
-  totalTransactions,
-  processedBatches,
-  totalBatches,
-  selectedTransactionIds = [],
-  transactionSetHash = null,
-  sourceYear = null,
-  sourceAccountCount = null,
-  heartbeatAt = null,
-  reusedExistingReview = false,
-  summary = {},
-  counts = {},
-  suggestions = [],
-  autoApplyHighConfidence = false,
-  errorMessage = null,
-  errorCode = null,
-  createdAt = null,
-  updatedAt = null,
-}) {
-  const normalizedStatus = String(status || REVIEW_STATUS.PREPARING).toLowerCase();
-  const normalizedPhase = normalizeReviewPhase(
-    currentPhase,
-    normalizedStatus === REVIEW_STATUS.COMPLETED
-      ? "completed"
-      : normalizedStatus === REVIEW_STATUS.FAILED
-      ? "failed"
-      : normalizedStatus === REVIEW_STATUS.CANCELLED
-      ? "cancelled"
-      : "preparing"
-  );
-  const normalizedProcessedTransactions = Math.max(0, Number(processedTransactions || 0));
-  const normalizedTotalTransactions = Math.max(0, Number(totalTransactions || 0));
-  const normalizedProcessedBatches = Math.max(0, Number(processedBatches || 0));
-  const normalizedTotalBatches = Math.max(0, Number(totalBatches || 0));
-  const percent = buildProgressPercent({
-    processedTransactions: normalizedProcessedTransactions,
-    totalTransactions: normalizedTotalTransactions,
-    processedBatches: normalizedProcessedBatches,
-    totalBatches: normalizedTotalBatches,
-    status: normalizedStatus,
-  });
-  const progress = {
-    stage: normalizedPhase,
-    stageIndex: {
-      preparing: 0,
-      reviewing: 1,
-      saving: 2,
-      finalizing: 3,
-      completed: 4,
-      failed: 4,
-      cancelled: 4,
-    }[normalizedPhase] ?? 0,
-    totalStages: 5,
-    processed: normalizedProcessedTransactions,
-    total: normalizedTotalTransactions,
-  };
-  const now = updatedAt || new Date().toISOString();
-
-  return {
-    id,
-    year,
-    mode,
-    status: normalizedStatus,
-    currentPhase: normalizedPhase,
-    progressPercent: percent,
-    processedTransactions: normalizedProcessedTransactions,
-    totalTransactions: normalizedTotalTransactions,
-    processedBatches: normalizedProcessedBatches,
-    totalBatches: normalizedTotalBatches,
-    autoApplyHighConfidence,
-    selectedTransactionIds,
-    transactionSetHash,
-    sourceYear,
-    sourceAccountCount,
-    heartbeatAt: heartbeatAt || now,
-    reusedExistingReview,
-    summary,
-    progress,
-    suggestions,
-    counts,
-    createdAt: createdAt || now,
-    updatedAt: now,
-    errorMessage,
-    errorCode,
-  };
-}
-
-async function runTaxAiReview({
-  uid,
-  store,
-  openaiClient,
-  logger = console,
-  config = buildTaxConfigFromEnv(),
-  reviewId,
-  year,
-  mode = "unreviewed",
-  transactions,
-  rules = [],
-  isCancelled = async () => false,
-  transactionSetHash = null,
-  sourceYear = null,
-  sourceAccountCount = null,
-}) {
-  const cappedTransactions = transactions.slice(0, config.maxTransactionsPerRun);
-  const totalTransactions = cappedTransactions.length;
-  const totalBatches = Math.ceil(totalTransactions / config.batchSize);
-  const startedAt = new Date().toISOString();
-  const suggestions = [];
-  let processedTransactions = 0;
-  let processedBatches = 0;
-  let currentPhase = "preparing";
-
-  const saveProgress = async ({
-    status = REVIEW_STATUS.PROCESSING,
-    phase = currentPhase,
-    extra = {},
-  } = {}) => store.upsertReview(uid, buildReviewProgressRecord({
-    id: reviewId,
-    year,
-    mode,
-    status,
-    currentPhase: phase,
-    processedTransactions,
-    totalTransactions,
-    processedBatches,
-    totalBatches,
-    selectedTransactionIds: [],
-    transactionSetHash,
-    sourceYear,
-    sourceAccountCount,
-    heartbeatAt: new Date().toISOString(),
-    autoApplyHighConfidence: false,
-    createdAt: startedAt,
-    summary: extra.summary || {},
-    counts: extra.counts || {},
-    suggestions: extra.suggestions || [],
-    errorMessage: extra.errorMessage || null,
-    errorCode: extra.errorCode || null,
-  }));
-
-  await saveProgress({ status: REVIEW_STATUS.PREPARING, phase: "preparing" });
-
-  try {
-    const batches = chunk(cappedTransactions, config.batchSize);
-    for (const batch of batches) {
-      if (await isCancelled()) {
-        currentPhase = "cancelled";
-        return await saveProgress({
-          status: REVIEW_STATUS.CANCELLED,
-          phase: "cancelled",
-          extra: {
-            errorMessage: "AI Tax Review was cancelled.",
-            errorCode: "CANCELLED",
-          },
-        });
-      }
-
-      currentPhase = "reviewing";
-      const aiCandidates = [];
-      for (const transaction of batch) {
-        const suggestion = deterministicSuggestion(transaction, rules);
-        if (suggestion) {
-          suggestions.push(suggestion);
-        } else {
-          aiCandidates.push(transaction);
-        }
-      }
-
-      if (aiCandidates.length) {
-        try {
-          const aiResults = await classifyWithAI({
-            openaiClient,
-            transactions: aiCandidates.map(buildSafeAiTransaction),
-            config,
-            logger,
-          });
-          suggestions.push(...aiResults);
-        } catch (error) {
-          const isStructuredOutputFailure =
-            error instanceof TaxAiReviewError &&
-            ["validation", "parsing"].includes(String(error.phase || "").toLowerCase());
-
-          if (isStructuredOutputFailure) {
-            logger.error("AI TAX STRUCTURED OUTPUT FAILURE", {
-              reviewId: String(reviewId || "").slice(0, 8),
-              processedTransactions,
-              batchSize: batch.length,
-              phase: error.phase,
-              errorCode: error.details?.code || "INVALID_STRUCTURED_OUTPUT",
-            });
-
-            throw error;
-          }
-
-          const details = error instanceof TaxAiReviewError
-            ? error.details
-            : extractOpenAIErrorDetails(error);
-          logger.error("AI TAX BATCH FALLBACK", {
-            reviewId: String(reviewId || "").slice(0, 8),
-            processedTransactions,
-            batchSize: batch.length,
-            errorCode: details?.code || error?.code || "UNKNOWN",
-          });
-
-          for (const transaction of aiCandidates) {
-            suggestions.push(buildSuggestion({
-              transaction,
-              classification: "needs_review",
-              deductibility: "needs_review",
-              taxCategory: "Needs professional review",
-              confidence: 0,
-              reason: "AI could not finish this transaction. Please review it manually.",
-              requiresUserReview: true,
-              flags: ["ai_batch_fallback"],
-              classificationSource: "ai_suggestion",
-            }));
-          }
-        }
-      }
-
-      processedTransactions = Math.min(totalTransactions, processedTransactions + batch.length);
-      processedBatches = Math.min(totalBatches || 0, processedBatches + 1);
-      await saveProgress({
-        status: REVIEW_STATUS.PROCESSING,
-        phase: "reviewing",
-      });
-    }
-
-    const summary = buildReviewSummary(suggestions, config);
-    processedTransactions = totalTransactions;
-    processedBatches = totalBatches;
-    currentPhase = "completed";
-    const review = await store.upsertReview(uid, buildReviewProgressRecord({
-      id: reviewId,
-      year,
-      mode,
-      status: REVIEW_STATUS.COMPLETED,
-      currentPhase: "completed",
-      processedTransactions,
-      totalTransactions,
-      processedBatches,
-      totalBatches,
-      createdAt: startedAt,
-      transactionSetHash,
-      sourceYear,
-      sourceAccountCount,
-      heartbeatAt: new Date().toISOString(),
-      summary,
-      counts: summary,
-      suggestions,
-      errorMessage: null,
-      errorCode: null,
-    }));
-
-    return review;
-  } catch (error) {
-    const details = error instanceof TaxAiReviewError
-      ? error.details
-      : extractOpenAIErrorDetails(error);
-    await store.upsertReview(uid, buildReviewProgressRecord({
-      id: reviewId,
-      year,
-      mode,
-      status: REVIEW_STATUS.FAILED,
-      currentPhase: error?.phase || currentPhase || "failed",
-      processedTransactions,
-      totalTransactions,
-      processedBatches,
-      totalBatches,
-      createdAt: startedAt,
-      transactionSetHash,
-      sourceYear,
-      sourceAccountCount,
-      heartbeatAt: new Date().toISOString(),
-      errorMessage: error?.message || TAX_REVIEW_USER_MESSAGE,
-      errorCode: details?.code || "UNKNOWN",
-      suggestions: [],
-    }));
-    throw error instanceof TaxAiReviewError
-      ? error
-      : new TaxAiReviewError(TAX_REVIEW_USER_MESSAGE, {
-          phase: currentPhase,
-          details,
-        });
-  }
-}
-
-function nextReviewId() {
-  return `review_${crypto.randomUUID()}`;
-}
-
-export {
-  buildSafeAiTransaction,
-  buildTaxConfigFromEnv,
-  buildReviewProgressRecord,
-  deterministicSuggestion,
-  extractOpenAIErrorDetails,
-  nextReviewId,
-  REVIEW_STATUS,
-  runTaxAiReview,
-  validateSuggestionShape,
-};
