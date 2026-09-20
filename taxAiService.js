@@ -998,3 +998,426 @@ function normalizeReviewPhase(currentPhase, fallback = REVIEW_STATUS.PREPARING) 
 function buildProgressPercent({
   processedTransactions,
   totalTransactions,
+  processedBatches,
+  totalBatches,
+  status,
+}) {
+  if (status === REVIEW_STATUS.COMPLETED) {
+    return 100;
+  }
+
+  const transactions = Math.max(0, Number(processedTransactions || 0));
+  const total = Math.max(0, Number(totalTransactions || 0));
+  const batches = Math.max(0, Number(processedBatches || 0));
+  const totalBatchCount = Math.max(0, Number(totalBatches || 0));
+
+  if (total > 0) {
+    return Math.max(0, Math.min(100, Math.round((transactions / total) * 100)));
+  }
+
+  if (totalBatchCount > 0) {
+    return Math.max(0, Math.min(100, Math.round((batches / totalBatchCount) * 100)));
+  }
+
+  return 0;
+}
+
+function buildReviewProgressRecord({
+  id,
+  year,
+  mode,
+  status,
+  currentPhase,
+  processedTransactions,
+  totalTransactions,
+  processedBatches,
+  totalBatches,
+  selectedTransactionIds = [],
+  transactionSetHash = null,
+  sourceYear = null,
+  sourceAccountCount = null,
+  heartbeatAt = null,
+  reusedExistingReview = false,
+  sourceTransactionCount = null,
+  autoResolvedTransactions = 0,
+  aiRequestedTransactions = 0,
+  aiCompletedTransactions = 0,
+  aiFailedTransactions = 0,
+  summary = {},
+  counts = {},
+  suggestions = [],
+  autoApplyHighConfidence = false,
+  errorMessage = null,
+  errorCode = null,
+  createdAt = null,
+  updatedAt = null,
+}) {
+  const normalizedStatus = String(status || REVIEW_STATUS.PREPARING).toLowerCase();
+  const normalizedPhase = normalizeReviewPhase(
+    currentPhase,
+    normalizedStatus === REVIEW_STATUS.COMPLETED
+      ? "completed"
+      : normalizedStatus === REVIEW_STATUS.FAILED
+      ? "failed"
+      : normalizedStatus === REVIEW_STATUS.CANCELLED
+      ? "cancelled"
+      : "preparing"
+  );
+  const normalizedProcessedTransactions = Math.max(0, Number(processedTransactions || 0));
+  const normalizedTotalTransactions = Math.max(0, Number(totalTransactions || 0));
+  const normalizedProcessedBatches = Math.max(0, Number(processedBatches || 0));
+  const normalizedTotalBatches = Math.max(0, Number(totalBatches || 0));
+  const percent = buildProgressPercent({
+    processedTransactions: normalizedProcessedTransactions,
+    totalTransactions: normalizedTotalTransactions,
+    processedBatches: normalizedProcessedBatches,
+    totalBatches: normalizedTotalBatches,
+    status: normalizedStatus,
+  });
+  const progress = {
+    stage: normalizedPhase,
+    stageIndex: {
+      preparing: 0,
+      reviewing: 1,
+      paused: 1,
+      saving: 2,
+      finalizing: 3,
+      completed: 4,
+      failed: 4,
+      cancelled: 4,
+    }[normalizedPhase] ?? 0,
+    totalStages: 5,
+    processed: normalizedProcessedTransactions,
+    total: normalizedTotalTransactions,
+  };
+  const now = updatedAt || new Date().toISOString();
+
+  return {
+    id,
+    year,
+    mode,
+    status: normalizedStatus,
+    currentPhase: normalizedPhase,
+    progressPercent: percent,
+    processedTransactions: normalizedProcessedTransactions,
+    totalTransactions: normalizedTotalTransactions,
+    processedBatches: normalizedProcessedBatches,
+    totalBatches: normalizedTotalBatches,
+    autoApplyHighConfidence,
+    selectedTransactionIds,
+    transactionSetHash,
+    sourceYear,
+    sourceAccountCount,
+    sourceTransactionCount: sourceTransactionCount == null ? null : Math.max(0, Number(sourceTransactionCount || 0)),
+    autoResolvedTransactions: Math.max(0, Number(autoResolvedTransactions || 0)),
+    aiRequestedTransactions: Math.max(0, Number(aiRequestedTransactions || 0)),
+    aiCompletedTransactions: Math.max(0, Number(aiCompletedTransactions || 0)),
+    aiFailedTransactions: Math.max(0, Number(aiFailedTransactions || 0)),
+    heartbeatAt: heartbeatAt || now,
+    reusedExistingReview,
+    summary,
+    progress,
+    suggestions,
+    counts,
+    createdAt: createdAt || now,
+    updatedAt: now,
+    errorMessage,
+    errorCode,
+  };
+}
+
+async function runTaxAiReview({
+  uid,
+  store,
+  openaiClient,
+  logger = console,
+  config = buildTaxConfigFromEnv(),
+  reviewId,
+  year,
+  mode = "unreviewed",
+  transactions,
+  rules = [],
+  readControlState = async () => REVIEW_STATUS.PROCESSING,
+  transactionSetHash = null,
+  sourceYear = null,
+  sourceAccountCount = null,
+  sourceTransactionCount = null,
+  selectedTransactionIds = [],
+  resumeFromProcessedTransactions = 0,
+  resumeFromProcessedBatches = 0,
+  initialSuggestions = [],
+  initialAutoResolvedTransactions = 0,
+  initialAiRequestedTransactions = 0,
+  initialAiCompletedTransactions = 0,
+  initialAiFailedTransactions = 0,
+  createdAt = null,
+}) {
+  // Full-year audits must not be silently truncated by an old deployment value such as 800.
+  // The deterministic layer resolves obvious records locally, so allow up to 5,000 records
+  // for `all` while preserving the configured cap for smaller targeted review modes.
+  const effectiveMaxTransactions = mode === "all"
+    ? Math.max(5000, Number(config.maxTransactionsPerRun || 0))
+    : Number(config.maxTransactionsPerRun || 1000);
+  const cappedTransactions = transactions.slice(0, effectiveMaxTransactions);
+  const totalTransactions = cappedTransactions.length;
+  const totalBatches = Math.ceil(totalTransactions / config.batchSize);
+  const startedAt = createdAt || new Date().toISOString();
+  const suggestions = Array.isArray(initialSuggestions) ? [...initialSuggestions] : [];
+  let processedTransactions = Math.max(0, Math.min(totalTransactions, Number(resumeFromProcessedTransactions || 0)));
+  let processedBatches = Math.max(0, Math.min(totalBatches, Number(resumeFromProcessedBatches || 0)));
+  let autoResolvedTransactions = Math.max(0, Number(initialAutoResolvedTransactions || 0));
+  let aiRequestedTransactions = Math.max(0, Number(initialAiRequestedTransactions || 0));
+  let aiCompletedTransactions = Math.max(0, Number(initialAiCompletedTransactions || 0));
+  let aiFailedTransactions = Math.max(0, Number(initialAiFailedTransactions || 0));
+  let currentPhase = processedTransactions > 0 ? "reviewing" : "preparing";
+
+  const saveProgress = async ({
+    status = REVIEW_STATUS.PROCESSING,
+    phase = currentPhase,
+    extra = {},
+  } = {}) => store.upsertReview(uid, buildReviewProgressRecord({
+    id: reviewId,
+    year,
+    mode,
+    status,
+    currentPhase: phase,
+    processedTransactions,
+    totalTransactions,
+    processedBatches,
+    totalBatches,
+    selectedTransactionIds: extra.selectedTransactionIds || selectedTransactionIds,
+    transactionSetHash,
+    sourceYear,
+    sourceAccountCount,
+    sourceTransactionCount,
+    autoResolvedTransactions,
+    aiRequestedTransactions,
+    aiCompletedTransactions,
+    aiFailedTransactions,
+    heartbeatAt: new Date().toISOString(),
+    autoApplyHighConfidence: false,
+    createdAt: startedAt,
+    summary: extra.summary || {},
+    counts: extra.counts || {},
+    suggestions: extra.suggestions || suggestions,
+    errorMessage: extra.errorMessage || null,
+    errorCode: extra.errorCode || null,
+  }));
+
+  const controlResult = async () => {
+    const state = String(await readControlState() || REVIEW_STATUS.PROCESSING).toLowerCase();
+    if (state === REVIEW_STATUS.CANCELLED) {
+      currentPhase = "cancelled";
+      return saveProgress({
+        status: REVIEW_STATUS.CANCELLED,
+        phase: "cancelled",
+        extra: {
+          errorMessage: "AI Tax Review was stopped by the user. Completed work was saved.",
+          errorCode: "CANCELLED",
+        },
+      });
+    }
+    if (state === REVIEW_STATUS.PAUSED) {
+      currentPhase = "paused";
+      return saveProgress({
+        status: REVIEW_STATUS.PAUSED,
+        phase: "paused",
+        extra: {
+          errorMessage: "AI Tax Review is paused. Progress is saved and can be resumed.",
+          errorCode: "PAUSED_BY_USER",
+        },
+      });
+    }
+    return null;
+  };
+
+  if (processedTransactions === 0) {
+    await saveProgress({ status: REVIEW_STATUS.PREPARING, phase: "preparing" });
+  }
+
+  try {
+    const remainingTransactions = cappedTransactions.slice(processedTransactions);
+    const batches = chunk(remainingTransactions, config.batchSize);
+    for (const batch of batches) {
+      const controlled = await controlResult();
+      if (controlled) return controlled;
+
+      currentPhase = "reviewing";
+      const suggestionCheckpoint = suggestions.length;
+      const autoCheckpoint = autoResolvedTransactions;
+      const requestedCheckpoint = aiRequestedTransactions;
+      const completedCheckpoint = aiCompletedTransactions;
+      const failedCheckpoint = aiFailedTransactions;
+      const aiCandidates = [];
+
+      for (const transaction of batch) {
+        const suggestion = deterministicSuggestion(transaction, rules);
+        if (suggestion) {
+          suggestions.push(suggestion);
+          autoResolvedTransactions += 1;
+        } else {
+          aiCandidates.push(transaction);
+        }
+      }
+
+      if (aiCandidates.length) {
+        aiRequestedTransactions += aiCandidates.length;
+        try {
+          const aiResults = await classifyWithAI({
+            openaiClient,
+            transactions: aiCandidates.map(buildSafeAiTransaction),
+            config,
+            logger,
+          });
+          suggestions.push(...aiResults);
+          aiCompletedTransactions += aiResults.length;
+        } catch (error) {
+          const details = error instanceof TaxAiReviewError
+            ? error.details
+            : extractOpenAIErrorDetails(error);
+
+          // Never report a failed OpenAI request as "analyzed". Roll this batch back to
+          // the previous durable checkpoint and pause so the user can resume later.
+          suggestions.length = suggestionCheckpoint;
+          autoResolvedTransactions = autoCheckpoint;
+          aiRequestedTransactions = requestedCheckpoint;
+          aiCompletedTransactions = completedCheckpoint;
+          aiFailedTransactions = failedCheckpoint + aiCandidates.length;
+
+          if (isQuotaExhaustedTaxAiError(error)) {
+            currentPhase = "paused";
+            return await saveProgress({
+              status: REVIEW_STATUS.PAUSED,
+              phase: "paused",
+              extra: {
+                errorMessage: "AI analysis paused because the AI service has no available credits. Your completed progress is saved.",
+                errorCode: "AI_CREDITS_EXHAUSTED",
+              },
+            });
+          }
+
+          const isStructuredOutputFailure =
+            error instanceof TaxAiReviewError &&
+            ["validation", "parsing"].includes(String(error.phase || "").toLowerCase());
+          if (isStructuredOutputFailure) {
+            throw error;
+          }
+
+          logger.error("AI TAX REVIEW PAUSED", {
+            reviewId: String(reviewId || "").slice(0, 8),
+            processedTransactions,
+            batchSize: batch.length,
+            errorCode: details?.code || error?.code || "UNKNOWN",
+          });
+          currentPhase = "paused";
+          return await saveProgress({
+            status: REVIEW_STATUS.PAUSED,
+            phase: "paused",
+            extra: {
+              errorMessage: "AI analysis was temporarily unavailable. Your completed progress is saved and can be resumed.",
+              errorCode: details?.code || "AI_TEMPORARILY_UNAVAILABLE",
+            },
+          });
+        }
+      }
+
+      const controlledAfterRequest = await controlResult();
+      if (controlledAfterRequest) return controlledAfterRequest;
+
+      processedTransactions = Math.min(totalTransactions, processedTransactions + batch.length);
+      processedBatches = Math.min(totalBatches || 0, processedBatches + 1);
+      await saveProgress({
+        status: REVIEW_STATUS.PROCESSING,
+        phase: "reviewing",
+      });
+    }
+
+    const summary = buildReviewSummary(suggestions, config);
+    processedTransactions = totalTransactions;
+    processedBatches = totalBatches;
+    currentPhase = "completed";
+    return await store.upsertReview(uid, buildReviewProgressRecord({
+      id: reviewId,
+      year,
+      mode,
+      status: REVIEW_STATUS.COMPLETED,
+      currentPhase: "completed",
+      processedTransactions,
+      totalTransactions,
+      processedBatches,
+      totalBatches,
+      selectedTransactionIds,
+      createdAt: startedAt,
+      transactionSetHash,
+      sourceYear,
+      sourceAccountCount,
+      sourceTransactionCount,
+      autoResolvedTransactions,
+      aiRequestedTransactions,
+      aiCompletedTransactions,
+      aiFailedTransactions,
+      heartbeatAt: new Date().toISOString(),
+      summary,
+      counts: summary,
+      suggestions,
+      errorMessage: null,
+      errorCode: null,
+    }));
+  } catch (error) {
+    const details = error instanceof TaxAiReviewError
+      ? error.details
+      : extractOpenAIErrorDetails(error);
+    const isValidationFailure = error instanceof TaxAiReviewError &&
+      ["validation", "parsing"].includes(String(error.phase || "").toLowerCase());
+    await store.upsertReview(uid, buildReviewProgressRecord({
+      id: reviewId,
+      year,
+      mode,
+      status: REVIEW_STATUS.FAILED,
+      currentPhase: "failed",
+      processedTransactions,
+      totalTransactions,
+      processedBatches,
+      totalBatches,
+      selectedTransactionIds,
+      createdAt: startedAt,
+      transactionSetHash,
+      sourceYear,
+      sourceAccountCount,
+      sourceTransactionCount,
+      autoResolvedTransactions,
+      aiRequestedTransactions,
+      aiCompletedTransactions,
+      aiFailedTransactions,
+      heartbeatAt: new Date().toISOString(),
+      errorMessage: isValidationFailure
+        ? "AI Tax Review validation failed. Start a new review."
+        : error?.message || TAX_REVIEW_USER_MESSAGE,
+      errorCode: isValidationFailure ? "INVALID_STRUCTURED_OUTPUT" : (details?.code || "UNKNOWN"),
+      suggestions,
+    }));
+    throw error instanceof TaxAiReviewError
+      ? error
+      : new TaxAiReviewError(TAX_REVIEW_USER_MESSAGE, {
+          phase: currentPhase,
+          details,
+        });
+  }
+}
+
+function nextReviewId() {
+  return `review_${crypto.randomUUID()}`;
+}
+
+export {
+  buildSafeAiTransaction,
+  buildTaxConfigFromEnv,
+  buildReviewProgressRecord,
+  deterministicSuggestion,
+  extractOpenAIErrorDetails,
+  isQuotaExhaustedTaxAiError,
+  nextReviewId,
+  REVIEW_STATUS,
+  runTaxAiReview,
+  validateSuggestionShape,
+};

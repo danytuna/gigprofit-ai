@@ -998,3 +998,785 @@ export function createTaxRouter({
   router.get("/transactions/duplicates/report", async (req, res) => {
     try {
       const year = normalizeYear(req.query.year);
+      const allTransactions = await taxStore.listTransactions(req.auth.uid);
+      const yearTransactions = allTransactions.filter((transaction) => new Date(transaction.date || "").getUTCFullYear() === year);
+      const grouped = new Map();
+      for (const transaction of yearTransactions) {
+        const key = transactionDedupeKey(transaction);
+        if (!key) continue;
+        const items = grouped.get(key) || [];
+        items.push(transaction);
+        grouped.set(key, items);
+      }
+
+      const duplicates = Array.from(grouped.values()).filter((items) => items.length > 1);
+      const pendingPostedPairs = duplicates.filter((items) => items.some((item) => item.pending) && items.some((item) => !item.pending)).length;
+      return res.json({
+        ok: true,
+        year,
+        totalDocuments: yearTransactions.length,
+        uniquePlaidTransactionIds: grouped.size,
+        duplicatesFound: duplicates.length,
+        pendingPostedPairs,
+      });
+    } catch (error) {
+      logger.error("TAX DUPLICATE REPORT ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to build duplicate report." });
+    }
+  });
+
+  router.patch("/transactions/:transactionId", async (req, res) => {
+    try {
+      const current = await taxStore.getTransaction(req.auth.uid, req.params.transactionId);
+      if (!current) {
+        return res.status(404).json({ ok: false, error: "Transaction not found." });
+      }
+
+      const patch = {
+        classification: req.body?.classification,
+        deductibility: req.body?.deductibility,
+        businessUsePercentage: req.body?.businessUsePercentage,
+        taxCategory: req.body?.taxCategory,
+        scheduleCategory: req.body?.scheduleCategory,
+        userNote: req.body?.userNote,
+        classificationSource: "manual",
+        userConfirmed: true,
+      };
+
+      const updated = await taxStore.upsertTransaction(
+        req.auth.uid,
+        applyPatchToTransaction(current, patch)
+      );
+
+      return res.json({ ok: true, transaction: buildTransactionResponse(updated) });
+    } catch (error) {
+      logger.error("TAX PATCH TRANSACTION ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to update transaction." });
+    }
+  });
+
+  router.post("/transactions/bulk-classify", async (req, res) => {
+    try {
+      const transactionIds = Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [];
+      if (!transactionIds.length) {
+        return res.status(400).json({ ok: false, error: "Missing transactionIds." });
+      }
+      if (req.body?.confirm !== true) {
+        return res.status(400).json({ ok: false, error: "Bulk changes require explicit confirmation." });
+      }
+
+      const saved = [];
+      for (const transactionId of transactionIds) {
+        const current = await taxStore.getTransaction(req.auth.uid, transactionId);
+        if (!current) continue;
+        saved.push(await taxStore.upsertTransaction(
+          req.auth.uid,
+          applyPatchToTransaction(current, {
+            classification: req.body?.classification,
+            deductibility: req.body?.deductibility,
+            taxCategory: req.body?.taxCategory,
+            businessUsePercentage: req.body?.businessUsePercentage,
+            classificationSource: "manual",
+            userConfirmed: true,
+          })
+        ));
+      }
+
+      return res.json({ ok: true, updated: saved.length, transactions: saved.map(buildTransactionResponse) });
+    } catch (error) {
+      logger.error("TAX BULK CLASSIFY ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to apply bulk classification." });
+    }
+  });
+
+  function buildCandidatesForReview({ yearTransactions, mode, selectedIds = [], reprocess = false }) {
+    let candidates = Array.isArray(yearTransactions) ? yearTransactions : [];
+    if (mode === "selected") {
+      const selectedSet = new Set(selectedIds);
+      candidates = candidates.filter((transaction) =>
+        selectedSet.has(transaction.id) && isReviewableTaxTransaction(transaction)
+      );
+    } else if (mode === "review_only") {
+      candidates = candidates.filter((transaction) =>
+        isReviewableTaxTransaction(transaction) &&
+        !transaction.userConfirmed &&
+        transaction.classification === "needs_review" &&
+        transaction.classificationSource !== "ai_suggestion"
+      );
+    } else if (mode === "unreviewed") {
+      candidates = candidates.filter((transaction) =>
+        reprocess ? isReviewableTaxTransaction(transaction) : isAiEligibleTransaction(transaction)
+      );
+    } else {
+      // Full-year audit. Obvious income/transfers/refunds are already resolved by the
+      // deterministic layer; every remaining tax-relevant transaction is audited here.
+      candidates = candidates.filter((transaction) => isReviewableTaxTransaction(transaction));
+    }
+    return dedupeTransactions(candidates);
+  }
+
+  async function finalizeCompletedReview({ uid, review, candidates, selectedIds, initialCreatedAt }) {
+    const totalTransactions = candidates.length;
+    const totalBatches = Math.ceil(totalTransactions / config.batchSize);
+    const progressTotals = {
+      processedTransactions: review.processedTransactions ?? totalTransactions,
+      totalTransactions: review.totalTransactions ?? totalTransactions,
+      processedBatches: review.processedBatches ?? totalBatches,
+      totalBatches: review.totalBatches ?? totalBatches,
+      heartbeatAt: new Date().toISOString(),
+      sourceTransactionCount: review.sourceTransactionCount ?? null,
+      autoResolvedTransactions: review.autoResolvedTransactions ?? 0,
+      aiRequestedTransactions: review.aiRequestedTransactions ?? 0,
+      aiCompletedTransactions: review.aiCompletedTransactions ?? 0,
+      aiFailedTransactions: review.aiFailedTransactions ?? 0,
+    };
+
+    await taxStore.upsertReview(uid, buildReviewProgressRecord({
+      ...review,
+      id: review.id,
+      year: review.year,
+      mode: review.mode,
+      status: REVIEW_STATUS.PROCESSING,
+      currentPhase: "saving",
+      selectedTransactionIds: selectedIds,
+      createdAt: initialCreatedAt || review.createdAt,
+      suggestions: review.suggestions || [],
+      ...progressTotals,
+    }));
+
+    const persistedSuggestions = [];
+    for (const suggestion of review.suggestions || []) {
+      const current = await taxStore.getTransaction(uid, suggestion.transactionId);
+      if (!current) continue;
+      if (current.userConfirmed || ["manual", "user_rule"].includes(current.classificationSource)) {
+        continue;
+      }
+      const transaction = await taxStore.upsertTransaction(uid, applyPatchToTransaction(current, {
+        classification: suggestion.classification,
+        transactionType: suggestion.transactionType,
+        deductibility: suggestion.deductibility,
+        taxCategory: suggestion.taxCategory,
+        businessUsePercentage: suggestion.businessUsePercentage,
+        classificationSource: "ai_suggestion",
+        confidence: suggestion.confidence,
+        aiReason: suggestion.reason,
+        userConfirmed: false,
+        reviewId: review.id,
+      }));
+      persistedSuggestions.push({ transaction, suggestion });
+    }
+
+    const savedSuggestions = persistedSuggestions.map(({ transaction, suggestion }) => ({
+      transactionId: transaction.id,
+      transactionType: suggestion.transactionType,
+      classification: transaction.classification,
+      deductibility: transaction.deductibility,
+      taxCategory: transaction.taxCategory,
+      businessUsePercentage: suggestion.businessUsePercentage ?? null,
+      confidence: transaction.confidence,
+      reason: transaction.aiReason,
+      requiresUserReview: suggestion.requiresUserReview !== false,
+      flags: suggestion.flags || [],
+      merchantIdentity: suggestion.merchantIdentity || null,
+      webLookupUsed: suggestion.webLookupUsed === true,
+      source: suggestion.source || (suggestion.webLookupUsed ? "aiAndWeb" : "ai"),
+      modelVersion: suggestion.modelVersion || config.model,
+      ruleVersion: suggestion.ruleVersion || "tax-rules-v5-audit-control",
+      reviewedAt: suggestion.reviewedAt || new Date().toISOString(),
+    }));
+
+    const finalizingReview = await taxStore.upsertReview(uid, buildReviewProgressRecord({
+      ...review,
+      id: review.id,
+      year: review.year,
+      mode: review.mode,
+      status: REVIEW_STATUS.PROCESSING,
+      currentPhase: "finalizing",
+      selectedTransactionIds: selectedIds,
+      createdAt: initialCreatedAt || review.createdAt,
+      suggestions: savedSuggestions,
+      ...progressTotals,
+      heartbeatAt: new Date().toISOString(),
+    }));
+
+    return taxStore.upsertReview(uid, buildReviewProgressRecord({
+      ...finalizingReview,
+      id: review.id,
+      year: review.year,
+      mode: review.mode,
+      status: REVIEW_STATUS.COMPLETED,
+      currentPhase: "completed",
+      selectedTransactionIds: selectedIds,
+      createdAt: initialCreatedAt || review.createdAt,
+      suggestions: savedSuggestions,
+      ...progressTotals,
+      heartbeatAt: new Date().toISOString(),
+    }));
+  }
+
+  function launchReviewWorker({ uid, review, candidates, selectedIds = [] }) {
+    void (async () => {
+      try {
+        const rules = await taxStore.listRules(uid);
+        const result = await runTaxAiReview({
+          uid,
+          store: taxStore,
+          openaiClient,
+          logger,
+          config,
+          reviewId: review.id,
+          year: review.year,
+          mode: review.mode,
+          transactions: candidates,
+          rules,
+          selectedTransactionIds: selectedIds,
+          transactionSetHash: review.transactionSetHash,
+          sourceYear: review.sourceYear ?? review.year,
+          sourceAccountCount: review.sourceAccountCount ?? 0,
+          sourceTransactionCount: review.sourceTransactionCount ?? null,
+          resumeFromProcessedTransactions: review.processedTransactions || 0,
+          resumeFromProcessedBatches: review.processedBatches || 0,
+          initialSuggestions: review.suggestions || [],
+          initialAutoResolvedTransactions: review.autoResolvedTransactions || 0,
+          initialAiRequestedTransactions: review.aiRequestedTransactions || 0,
+          initialAiCompletedTransactions: review.aiCompletedTransactions || 0,
+          initialAiFailedTransactions: review.aiFailedTransactions || 0,
+          createdAt: review.createdAt,
+          readControlState: async () => {
+            const current = await taxStore.getReview(uid, review.id);
+            return current?.status || REVIEW_STATUS.PROCESSING;
+          },
+        });
+
+        if ([REVIEW_STATUS.PAUSED, REVIEW_STATUS.CANCELLED].includes(result.status)) {
+          return;
+        }
+        if (result.status !== REVIEW_STATUS.COMPLETED) {
+          return;
+        }
+        await finalizeCompletedReview({
+          uid,
+          review: result,
+          candidates,
+          selectedIds,
+          initialCreatedAt: review.createdAt,
+        });
+      } catch (backgroundError) {
+        logger.error("TAX AI REVIEW BACKGROUND ERROR", errorSummary(backgroundError));
+        const current = await taxStore.getReview(uid, review.id);
+        // runTaxAiReview already persists a durable failure/paused checkpoint. Only create
+        // a fallback failure record when no state was saved at all.
+        if (!current || isActiveReviewStatus(current.status)) {
+          const structuredCode = backgroundError?.phase === "validation"
+            ? "INVALID_STRUCTURED_OUTPUT"
+            : backgroundError?.details?.code || backgroundError?.details?.type || backgroundError?.code || "REVIEW_INTERRUPTED";
+          await taxStore.upsertReview(uid, buildReviewProgressRecord({
+            ...review,
+            id: review.id,
+            status: REVIEW_STATUS.FAILED,
+            currentPhase: "failed",
+            processedTransactions: current?.processedTransactions || review.processedTransactions || 0,
+            totalTransactions: current?.totalTransactions || review.totalTransactions || candidates.length,
+            processedBatches: current?.processedBatches || review.processedBatches || 0,
+            totalBatches: current?.totalBatches || review.totalBatches || Math.ceil(candidates.length / config.batchSize),
+            selectedTransactionIds: selectedIds,
+            sourceTransactionCount: current?.sourceTransactionCount ?? review.sourceTransactionCount ?? null,
+            autoResolvedTransactions: current?.autoResolvedTransactions || review.autoResolvedTransactions || 0,
+            aiRequestedTransactions: current?.aiRequestedTransactions || review.aiRequestedTransactions || 0,
+            aiCompletedTransactions: current?.aiCompletedTransactions || review.aiCompletedTransactions || 0,
+            aiFailedTransactions: current?.aiFailedTransactions || review.aiFailedTransactions || 0,
+            suggestions: current?.suggestions || review.suggestions || [],
+            heartbeatAt: new Date().toISOString(),
+            errorMessage: backgroundError?.message || "AI Tax Review was interrupted. Your completed progress was saved.",
+            errorCode: structuredCode,
+          }));
+        }
+      }
+    })();
+  }
+
+  router.post("/ai/review", async (req, res) => {
+    try {
+      if (!config.enabled) {
+        return res.status(403).json({ ok: false, error: "AI Tax Review is disabled." });
+      }
+
+      const year = normalizeYear(req.body?.year);
+      const mode = ["unreviewed", "review_only", "selected", "all"].includes(req.body?.mode) ? req.body.mode : "unreviewed";
+      const reprocess = req.body?.reprocess === true;
+      const autoApplyHighConfidence = config.autoApplyEnabled && req.body?.autoApplyHighConfidence === true;
+      const selectedIds = Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [];
+      const selectedKey = [...selectedIds].sort().join("|");
+      const existingReviews = await taxStore.listReviews(req.auth.uid);
+      const allTransactions = await taxStore.listTransactions(req.auth.uid);
+      const yearTransactions = dedupeTransactions(allTransactions.filter((transaction) =>
+        new Date(transaction.date || "").getUTCFullYear() === year && transaction.pending !== true
+      ));
+      const latestReview = findLatestReviewForYear(existingReviews, year);
+      const currentTaxCenterCounts = buildTaxCenterCounts(yearTransactions, latestReview);
+      const today = new Date().toISOString().slice(0, 10);
+      const todayCount = existingReviews.filter((review) => String(review.createdAt || "").slice(0, 10) === today).length;
+      if (todayCount >= config.dailyRunLimit) {
+        return res.status(429).json({ ok: false, error: "Daily AI tax review limit reached." });
+      }
+
+      const existing = existingReviews.find((review) =>
+        review.year === year &&
+        review.mode === mode &&
+        String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
+        ["queued", "running", "preparing", "processing"].includes(String(review.status || "").toLowerCase())
+      );
+      if (existing && isStalledReview(existing)) {
+        await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+          ...existing,
+          status: REVIEW_STATUS.PAUSED,
+          currentPhase: "paused",
+          errorMessage: "AI Tax Review was interrupted. Progress is saved and can be resumed.",
+          errorCode: "REVIEW_INTERRUPTED",
+          heartbeatAt: new Date().toISOString(),
+        }));
+      }
+
+      const candidates = buildCandidatesForReview({ yearTransactions, mode, selectedIds, reprocess });
+      const sourceAccountCount = new Set(
+        yearTransactions.map((transaction) => String(transaction.accountId || transaction.itemId || "").trim()).filter(Boolean)
+      ).size;
+      const transactionSetHash = hashTransactionSet({
+        year,
+        mode,
+        selectedTransactionIds: selectedIds,
+        transactions: candidates,
+        sourceAccountCount,
+      });
+      const matchingReview = existingReviews.find((review) =>
+        review.year === year &&
+        review.mode === mode &&
+        review.transactionSetHash === transactionSetHash &&
+        String((review.selectedTransactionIds || []).slice().sort().join("|")) === selectedKey &&
+        ["queued", "running", "preparing", "processing"].includes(String(review.status || "").toLowerCase())
+      );
+
+      if (shouldReuseExistingReview(matchingReview, currentTaxCenterCounts)) {
+        return res.json({ ok: true, review: buildReviewResponse(matchingReview, currentTaxCenterCounts), reused: true });
+      }
+
+      const reviewId = nextReviewId();
+      const totalTransactions = candidates.length;
+      const totalBatches = Math.ceil(totalTransactions / config.batchSize);
+      const initialReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        id: reviewId,
+        year,
+        mode,
+        status: REVIEW_STATUS.PREPARING,
+        currentPhase: "preparing",
+        processedTransactions: 0,
+        totalTransactions,
+        processedBatches: 0,
+        totalBatches,
+        selectedTransactionIds: selectedIds,
+        autoApplyHighConfidence,
+        transactionSetHash,
+        sourceYear: year,
+        sourceAccountCount,
+        sourceTransactionCount: yearTransactions.length,
+        heartbeatAt: new Date().toISOString(),
+      }));
+      const initialTaxCenterCounts = buildTaxCenterCounts(yearTransactions, initialReview);
+
+      launchReviewWorker({ uid: req.auth.uid, review: initialReview, candidates, selectedIds });
+      return res.status(201).json({ ok: true, review: buildReviewResponse(initialReview, initialTaxCenterCounts) });
+    } catch (error) {
+      logger.error("TAX AI REVIEW ERROR", errorSummary(error));
+      return res.status(503).json({ ok: false, error: error?.message || "AI Tax Review is temporarily unavailable. Please try again." });
+    }
+  });
+
+  router.get("/ai/reviews/:reviewId", async (req, res) => {
+    const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+    if (!review) {
+      return res.status(404).json({ ok: false, error: "AI review not found." });
+    }
+    if (isStalledReview(review)) {
+      const stalledReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...review,
+        status: REVIEW_STATUS.PAUSED,
+        currentPhase: "paused",
+        errorMessage: "AI Tax Review was interrupted. Completed progress is saved and can be resumed.",
+        errorCode: "REVIEW_INTERRUPTED",
+        heartbeatAt: new Date().toISOString(),
+      }));
+      const yearTransactions = dedupeTransactions((await taxStore.listTransactions(req.auth.uid))
+        .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year));
+      const taxCenterCounts = buildTaxCenterCounts(yearTransactions, stalledReview);
+      return res.json({ ok: true, review: buildReviewResponse(stalledReview, taxCenterCounts) });
+    }
+    const yearTransactions = (await taxStore.listTransactions(req.auth.uid))
+      .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year);
+    const dedupedYearTransactions = dedupeTransactions(yearTransactions);
+    const taxCenterCounts = buildTaxCenterCounts(dedupedYearTransactions, review);
+    return res.json({ ok: true, review: buildReviewResponse(review, taxCenterCounts) });
+  });
+
+  router.post("/ai/reviews/:reviewId/pause", async (req, res) => {
+    try {
+      const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+      if (!review) return res.status(404).json({ ok: false, error: "AI review not found." });
+      if (!["queued", "running", "preparing", "processing"].includes(String(review.status || "").toLowerCase())) {
+        return res.json({ ok: true, review: buildReviewResponse(review), changed: false });
+      }
+      const paused = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...review,
+        status: REVIEW_STATUS.PAUSED,
+        currentPhase: "paused",
+        suggestions: review.suggestions || [],
+        heartbeatAt: new Date().toISOString(),
+        errorMessage: "AI Tax Review is paused. Completed progress is saved.",
+        errorCode: "PAUSED_BY_USER",
+      }));
+      return res.json({ ok: true, review: buildReviewResponse(paused), changed: true });
+    } catch (error) {
+      logger.error("TAX AI PAUSE ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to pause AI Tax Review." });
+    }
+  });
+
+  router.post("/ai/reviews/:reviewId/resume", async (req, res) => {
+    try {
+      const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+      if (!review) return res.status(404).json({ ok: false, error: "AI review not found." });
+      if (String(review.status || "").toLowerCase() !== REVIEW_STATUS.PAUSED) {
+        return res.status(409).json({ ok: false, error: "Only a paused AI review can be resumed." });
+      }
+
+      const allTransactions = await taxStore.listTransactions(req.auth.uid);
+      const yearTransactions = dedupeTransactions(allTransactions.filter((transaction) =>
+        new Date(transaction.date || "").getUTCFullYear() === review.year && transaction.pending !== true
+      ));
+      const selectedIds = Array.isArray(review.selectedTransactionIds) ? review.selectedTransactionIds : [];
+      const candidates = buildCandidatesForReview({
+        yearTransactions,
+        mode: review.mode,
+        selectedIds,
+        reprocess: review.mode === "all",
+      });
+      const sourceAccountCount = new Set(
+        yearTransactions.map((transaction) => String(transaction.accountId || transaction.itemId || "").trim()).filter(Boolean)
+      ).size;
+      const currentHash = hashTransactionSet({
+        year: review.year,
+        mode: review.mode,
+        selectedTransactionIds: selectedIds,
+        transactions: candidates,
+        sourceAccountCount,
+      });
+      if (review.transactionSetHash && currentHash !== review.transactionSetHash) {
+        return res.status(409).json({
+          ok: false,
+          error: "Bank activity changed since this review started. Start a new full-year audit so GigProfit can reconcile the new transactions safely.",
+          errorCode: "TRANSACTION_SET_CHANGED",
+        });
+      }
+
+      const resumed = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...review,
+        status: REVIEW_STATUS.PROCESSING,
+        currentPhase: "reviewing",
+        totalTransactions: candidates.length,
+        totalBatches: Math.ceil(candidates.length / config.batchSize),
+        selectedTransactionIds: selectedIds,
+        sourceAccountCount,
+        sourceTransactionCount: yearTransactions.length,
+        suggestions: review.suggestions || [],
+        heartbeatAt: new Date().toISOString(),
+        errorMessage: null,
+        errorCode: null,
+      }));
+      launchReviewWorker({ uid: req.auth.uid, review: resumed, candidates, selectedIds });
+      return res.json({ ok: true, review: buildReviewResponse(resumed), resumed: true });
+    } catch (error) {
+      logger.error("TAX AI RESUME ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to resume AI Tax Review." });
+    }
+  });
+
+  router.post("/ai/reviews/:reviewId/cancel", async (req, res) => {
+    try {
+      const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+      if (!review) return res.status(404).json({ ok: false, error: "AI review not found." });
+      const stopped = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...review,
+        status: REVIEW_STATUS.CANCELLED,
+        currentPhase: "cancelled",
+        suggestions: review.suggestions || [],
+        heartbeatAt: new Date().toISOString(),
+        errorMessage: "AI Tax Review was stopped. Completed progress was kept.",
+        errorCode: "CANCELLED_BY_USER",
+      }));
+      return res.json({ ok: true, review: buildReviewResponse(stopped), stopped: true });
+    } catch (error) {
+      logger.error("TAX AI CANCEL ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to stop AI Tax Review." });
+    }
+  });
+
+  router.post("/ai/reviews/:reviewId/apply", async (req, res) => {
+    try {
+      const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+      if (!review) {
+        return res.status(404).json({ ok: false, error: "AI review not found." });
+      }
+      if (req.body?.confirm !== true) {
+        return res.status(400).json({ ok: false, error: "Applying AI suggestions requires explicit confirmation." });
+      }
+
+      const preview = buildApplyPreview(review, {
+        mode: req.body?.mode || "all",
+        transactionIds: Array.isArray(req.body?.transactionIds) ? req.body.transactionIds : [],
+      }, config.highConfidenceThreshold);
+      if (!preview.count) {
+        return res.status(400).json({ ok: false, error: "No AI suggestions are available to apply." });
+      }
+
+      const saved = [];
+      const pendingWrites = [];
+      let needsReview = 0;
+      let skippedManual = 0;
+      let invalid = 0;
+      let failed = 0;
+      for (const suggestion of preview.suggestions) {
+        const current = await taxStore.getTransaction(req.auth.uid, suggestion.transactionId);
+        if (!current) {
+          invalid += 1;
+          continue;
+        }
+        if (current.userConfirmed || ["manual", "user_rule"].includes(current.classificationSource)) {
+          skippedManual += 1;
+          continue;
+        }
+        const isSafe = suggestion.requiresUserReview !== true
+          && suggestion.classification !== "needs_review"
+          && suggestion.deductibility !== "needs_review"
+          && Number(suggestion.confidence || 0) >= config.highConfidenceThreshold;
+        if (!isSafe) {
+          needsReview += 1;
+          continue;
+        }
+        pendingWrites.push(applyPatchToTransaction(current, {
+          classification: suggestion.classification,
+          transactionType: suggestion.transactionType,
+          deductibility: suggestion.deductibility,
+          taxCategory: suggestion.taxCategory,
+          classificationSource: "ai_approved",
+          confidence: suggestion.confidence,
+          aiReason: suggestion.reason,
+          userConfirmed: true,
+        }));
+      }
+
+      for (let index = 0; index < pendingWrites.length; index += 400) {
+        const batch = pendingWrites.slice(index, index + 400);
+        try {
+          saved.push(...await taxStore.bulkUpsertTransactions(req.auth.uid, batch));
+        } catch (error) {
+          failed += batch.length;
+          logger.error("TAX AI APPLY BATCH ERROR", {
+            reviewId: String(req.params.reviewId || "").slice(0, 8),
+            batchSize: batch.length,
+            errorCode: error?.code || "BATCH_WRITE_FAILED",
+          });
+        }
+      }
+
+      await taxStore.upsertReview(req.auth.uid, {
+        ...review,
+        status: "applied",
+        appliedAt: new Date().toISOString(),
+      });
+
+      return res.json({
+        ok: true,
+        updated: saved.length,
+        applied: saved.length,
+        needsReview,
+        skippedManual,
+        invalid,
+        failed,
+        transactions: saved.map(buildTransactionResponse),
+        preview: {
+          count: preview.count,
+          message: `These are organization suggestions for tax review and do not replace professional advice.`,
+        },
+      });
+    } catch (error) {
+      logger.error("TAX AI APPLY ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to apply AI suggestions." });
+    }
+  });
+
+
+  router.post("/ai/reset-active-review", async (req, res) => {
+    try {
+      const year = normalizeYear(req.body?.year);
+      const reviews = await taxStore.listReviews(req.auth.uid);
+      const active = reviews
+        .filter((review) => review.year === year && isActiveReviewStatus(review.status))
+        .sort((left, right) => reviewSortValue(right).localeCompare(reviewSortValue(left)))[0] || null;
+
+      if (!active) {
+        return res.json({ ok: true, reset: false });
+      }
+
+      const resetReview = await taxStore.upsertReview(req.auth.uid, buildReviewProgressRecord({
+        ...active,
+        id: active.id,
+        status: REVIEW_STATUS.CANCELLED,
+        currentPhase: "cancelled",
+        processedTransactions: active.processedTransactions || 0,
+        totalTransactions: active.totalTransactions || 0,
+        processedBatches: active.processedBatches || 0,
+        totalBatches: active.totalBatches || 0,
+        heartbeatAt: new Date().toISOString(),
+        errorMessage: "AI Tax Review was reset by the user.",
+        errorCode: "MANUAL_RESET",
+      }));
+
+      return res.json({ ok: true, reset: true, review: buildReviewResponse(resetReview) });
+    } catch (error) {
+      logger.error("TAX AI RESET ERROR", errorSummary(error));
+      return res.status(500).json({ ok: false, error: "Failed to reset AI Tax Review." });
+    }
+  });
+
+  router.delete("/ai/reviews/:reviewId", async (req, res) => {
+    const review = await taxStore.getReview(req.auth.uid, req.params.reviewId);
+    if (!review) {
+      return res.status(404).json({ ok: false, error: "AI review not found." });
+    }
+    await taxStore.deleteTransactionsByReview(req.auth.uid, req.params.reviewId);
+    await taxStore.deleteReview(req.auth.uid, req.params.reviewId);
+    return res.json({ ok: true, deleted: true });
+  });
+
+  router.get("/rules", async (req, res) => {
+    const rules = await taxStore.listRules(req.auth.uid);
+    return res.json({ ok: true, rules });
+  });
+
+  router.post("/rules", async (req, res) => {
+    const rule = await taxStore.upsertRule(req.auth.uid, {
+      merchantPattern: req.body?.merchantPattern || null,
+      plaidCategory: req.body?.plaidCategory || null,
+      accountScope: req.body?.accountScope || null,
+      classification: req.body?.classification,
+      deductibility: req.body?.deductibility,
+      taxCategory: req.body?.taxCategory || null,
+      businessUsePercentage: req.body?.businessUsePercentage ?? null,
+      enabled: req.body?.enabled !== false,
+      priority: req.body?.priority || 100,
+      source: "user",
+    });
+    return res.status(201).json({ ok: true, rule });
+  });
+
+  router.patch("/rules/:ruleId", async (req, res) => {
+    const current = await taxStore.getRule(req.auth.uid, req.params.ruleId);
+    if (!current) {
+      return res.status(404).json({ ok: false, error: "Rule not found." });
+    }
+    const rule = await taxStore.upsertRule(req.auth.uid, {
+      ...current,
+      merchantPattern: req.body?.merchantPattern ?? current.merchantPattern,
+      plaidCategory: req.body?.plaidCategory ?? current.plaidCategory,
+      accountScope: req.body?.accountScope ?? current.accountScope,
+      classification: req.body?.classification ?? current.classification,
+      deductibility: req.body?.deductibility ?? current.deductibility,
+      taxCategory: req.body?.taxCategory ?? current.taxCategory,
+      businessUsePercentage: req.body?.businessUsePercentage ?? current.businessUsePercentage,
+      enabled: req.body?.enabled ?? current.enabled,
+      priority: req.body?.priority ?? current.priority,
+    });
+    return res.json({ ok: true, rule });
+  });
+
+  router.delete("/rules/:ruleId", async (req, res) => {
+    const deleted = await taxStore.deleteRule(req.auth.uid, req.params.ruleId);
+    if (!deleted) {
+      return res.status(404).json({ ok: false, error: "Rule not found." });
+    }
+    return res.json({ ok: true, deleted: true });
+  });
+
+  router.post("/rules/:ruleId/apply-retroactively", async (req, res) => {
+    const rule = await taxStore.getRule(req.auth.uid, req.params.ruleId);
+    if (!rule) {
+      return res.status(404).json({ ok: false, error: "Rule not found." });
+    }
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ ok: false, error: "Retroactive rule application requires explicit confirmation." });
+    }
+    const transactions = await taxStore.listTransactions(req.auth.uid);
+    const updated = [];
+    for (const transaction of transactions) {
+      const suggestion = deterministicSuggestion(transaction, [rule]);
+      if (!suggestion || suggestion.classificationSource !== "user_rule") continue;
+      updated.push(await taxStore.upsertTransaction(req.auth.uid, applyPatchToTransaction(transaction, {
+        classification: suggestion.classification,
+        deductibility: suggestion.deductibility,
+        taxCategory: suggestion.taxCategory,
+        businessUsePercentage: rule.businessUsePercentage ?? null,
+        classificationSource: "user_rule",
+        confidence: suggestion.confidence,
+        aiReason: suggestion.reason,
+        userConfirmed: true,
+        lastAppliedRuleId: rule.id,
+      })));
+    }
+    return res.json({ ok: true, updated: updated.length, transactions: updated.map(buildTransactionResponse) });
+  });
+
+  router.get("/summary", async (req, res) => {
+    const year = normalizeYear(req.query.year);
+    const transactions = (await taxStore.listTransactions(req.auth.uid))
+      .filter((item) => new Date(item.date || "").getUTCFullYear() === year);
+    const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
+    const taxCenterCounts = buildTaxCenterCounts(transactions, latestReview);
+    const effectiveTransactions = buildSummaryTransactions(
+      transactions,
+      latestReview,
+      config.highConfidenceThreshold
+    );
+    return res.json({
+      ok: true,
+      year,
+      summary: {
+        ...buildSummary(effectiveTransactions, config.highConfidenceThreshold),
+        taxCenterCounts,
+      },
+      latestReview: latestReview ? buildReviewResponse(latestReview, taxCenterCounts) : null,
+    });
+  });
+
+  router.delete("/suggestions", async (req, res) => {
+    const deleted = await taxStore.clearSuggestions(req.auth.uid);
+    return res.json({ ok: true, deleted });
+  });
+
+  router.delete("/rules", async (req, res) => {
+    const deleted = await taxStore.clearRules(req.auth.uid);
+    return res.json({ ok: true, deleted });
+  });
+
+  return router;
+}
+
+export {
+  buildTaxCenterCounts,
+  buildReviewResponse,
+  buildSummary,
+  buildTransactionResponse,
+  fetchPlaidTransactionsForUser,
+  findLatestReviewForYear,
+  mapPlaidTransaction,
+  shouldReuseExistingReview,
+  yearDateRange,
+};
