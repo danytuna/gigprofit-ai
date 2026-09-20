@@ -481,6 +481,15 @@ function choosePreferredTransaction(left, right) {
   return rightScore > leftScore ? right : left;
 }
 
+function filterTransactionsToActiveItems(records, activeItemIds) {
+  const active = activeItemIds instanceof Set ? activeItemIds : new Set(activeItemIds || []);
+  return (Array.isArray(records) ? records : []).filter((record) => {
+    const itemId = String(record?.itemId || "").trim();
+    // Keep non-Plaid/manual records, but ignore transactions that belong to a disconnected Plaid Item.
+    return !itemId || active.has(itemId);
+  });
+}
+
 function dedupeTransactions(records) {
   const grouped = new Map();
 
@@ -957,14 +966,18 @@ export function createTaxRouter({
       });
 
       await taxStore.bulkUpsertTransactions(req.auth.uid, merged);
-      const refreshed = dedupeTransactions((await taxStore.listTransactions(req.auth.uid))
-        .filter((record) => new Date(record.date || "").getUTCFullYear() === year)
-        .filter((record) => {
-          if (replacedPendingIds.has(record.id) || replacedPendingIds.has(record.plaidTransactionId)) {
-            return false;
-          }
-          return true;
-        }));
+      const activeItemIds = new Set((await plaidStore.getItems(req.auth.uid)).map((item) => String(item.itemId || "").trim()).filter(Boolean));
+      const refreshed = dedupeTransactions(filterTransactionsToActiveItems(
+        (await taxStore.listTransactions(req.auth.uid))
+          .filter((record) => new Date(record.date || "").getUTCFullYear() === year)
+          .filter((record) => {
+            if (replacedPendingIds.has(record.id) || replacedPendingIds.has(record.plaidTransactionId)) {
+              return false;
+            }
+            return true;
+          }),
+        activeItemIds
+      ));
       const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
       const scopedTransactions = refreshed.filter((record) => passesFilters(record, req.query));
       const effectiveScopedTransactions = buildSummaryTransactions(
@@ -1309,8 +1322,12 @@ export function createTaxRouter({
       const selectedKey = [...selectedIds].sort().join("|");
       const existingReviews = await taxStore.listReviews(req.auth.uid);
       const allTransactions = await taxStore.listTransactions(req.auth.uid);
-      const yearTransactions = dedupeTransactions(allTransactions.filter((transaction) =>
-        new Date(transaction.date || "").getUTCFullYear() === year && transaction.pending !== true
+      const activeItemIds = new Set((await plaidStore.getItems(req.auth.uid)).map((item) => String(item.itemId || "").trim()).filter(Boolean));
+      const yearTransactions = dedupeTransactions(filterTransactionsToActiveItems(
+        allTransactions.filter((transaction) =>
+          new Date(transaction.date || "").getUTCFullYear() === year && transaction.pending !== true
+        ),
+        activeItemIds
       ));
       const latestReview = findLatestReviewForYear(existingReviews, year);
       const currentTaxCenterCounts = buildTaxCenterCounts(yearTransactions, latestReview);
@@ -1410,8 +1427,12 @@ export function createTaxRouter({
       const taxCenterCounts = buildTaxCenterCounts(yearTransactions, stalledReview);
       return res.json({ ok: true, review: buildReviewResponse(stalledReview, taxCenterCounts) });
     }
-    const yearTransactions = (await taxStore.listTransactions(req.auth.uid))
-      .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year);
+    const activeItemIds = new Set((await plaidStore.getItems(req.auth.uid)).map((item) => String(item.itemId || "").trim()).filter(Boolean));
+    const yearTransactions = filterTransactionsToActiveItems(
+      (await taxStore.listTransactions(req.auth.uid))
+        .filter((item) => new Date(item.date || "").getUTCFullYear() === review.year),
+      activeItemIds
+    );
     const dedupedYearTransactions = dedupeTransactions(yearTransactions);
     const taxCenterCounts = buildTaxCenterCounts(dedupedYearTransactions, review);
     return res.json({ ok: true, review: buildReviewResponse(review, taxCenterCounts) });
@@ -1736,8 +1757,12 @@ export function createTaxRouter({
 
   router.get("/summary", async (req, res) => {
     const year = normalizeYear(req.query.year);
-    const transactions = (await taxStore.listTransactions(req.auth.uid))
-      .filter((item) => new Date(item.date || "").getUTCFullYear() === year);
+    const activeItemIds = new Set((await plaidStore.getItems(req.auth.uid)).map((item) => String(item.itemId || "").trim()).filter(Boolean));
+    const transactions = filterTransactionsToActiveItems(
+      (await taxStore.listTransactions(req.auth.uid))
+        .filter((item) => new Date(item.date || "").getUTCFullYear() === year),
+      activeItemIds
+    );
     const latestReview = findLatestReviewForYear(await taxStore.listReviews(req.auth.uid), year);
     const taxCenterCounts = buildTaxCenterCounts(transactions, latestReview);
     const effectiveTransactions = buildSummaryTransactions(
