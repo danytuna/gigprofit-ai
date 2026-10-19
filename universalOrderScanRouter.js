@@ -12,6 +12,7 @@ function cleanText(value, max = 500) {
 }
 
 function clampNumber(value, min, max) {
+  if (value == null || value === "") return null;
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
   return Math.min(max, Math.max(min, number));
@@ -62,6 +63,27 @@ function normalizeExtraction(value = {}) {
     confidence: clampNumber(value.confidence, 0, 1) ?? 0,
     explanation: cleanText(value.explanation, 500),
     rawVisibleOfferText: cleanText(value.rawVisibleOfferText, 2000),
+  };
+}
+
+// Diagnostics intentionally log only controlled enums/identifiers, never the
+// screenshot, prompt, OpenAI error message, Firebase token, or user ID.
+function safeDiagnosticIdentifier(value) {
+  return typeof value === "string" && /^[a-zA-Z0-9_.-]{1,80}$/.test(value)
+    ? value
+    : null;
+}
+
+function errorDiagnostic(error, stage) {
+  const upstream = error?.error;
+  return {
+    stage,
+    name: safeDiagnosticIdentifier(error?.name) || "Error",
+    code: safeDiagnosticIdentifier(error?.code),
+    status: Number.isInteger(error?.status) ? error.status : null,
+    type: safeDiagnosticIdentifier(upstream?.type || error?.type),
+    causeCode: safeDiagnosticIdentifier(error?.cause?.code),
+    requestId: safeDiagnosticIdentifier(error?.request_id),
   };
 }
 
@@ -145,6 +167,9 @@ export function createUniversalOrderScanRouter({
     let reservation = null;
     let screenshotHash = "";
     let uid = "";
+    let stage = "availability";
+    let modelResponseStatus = null;
+    let modelIncompleteReason = null;
     try {
       if (!hasOpenAIKey || !openaiClient) {
         return res.status(503).json({
@@ -152,6 +177,7 @@ export function createUniversalOrderScanRouter({
         });
       }
 
+      stage = "validate_image";
       const imageBase64 = cleanText(
         req.body?.imageBase64,
         MAX_IMAGE_BASE64_LENGTH + 1
@@ -173,6 +199,7 @@ export function createUniversalOrderScanRouter({
       screenshotHash = crypto.createHash("sha256").update(imageBase64).digest("hex");
       uid = String(req.user?.uid || "");
       const timezoneIdentifier = cleanText(req.body?.timezoneIdentifier || "UTC", 80);
+      stage = "reserve_usage";
       reservation = await usageStore.reserve({ uid, screenshotHash, timezoneIdentifier });
       if (reservation.status === "duplicate") {
         return res.status(409).json({ code: "duplicate_screenshot", error: "This screenshot was already analyzed today.", scanCount: reservation.scanCount, dateKey: reservation.dateKey });
@@ -212,6 +239,7 @@ Important rules:
 - Return only JSON matching the schema.
 `;
 
+      stage = "openai_request";
       const response = await openaiClient.responses.create({
         model: MODEL,
         input: [
@@ -287,17 +315,27 @@ Important rules:
             },
           },
         },
-        max_output_tokens: 700,
+        max_output_tokens: 1400,
       });
 
+      stage = "parse_openai_response";
+      modelResponseStatus = safeDiagnosticIdentifier(response?.status);
+      modelIncompleteReason = safeDiagnosticIdentifier(response?.incomplete_details?.reason);
       const raw = extractResponseText(response);
+      if (!raw.trim()) {
+        const emptyOutputError = new Error("Empty model output");
+        emptyOutputError.code = "empty_model_output";
+        throw emptyOutputError;
+      }
       const parsed = JSON.parse(raw);
       const result = normalizeExtraction(parsed);
 
       if (!result.foundOrder || ["pickup_only", "not_order", "invalid"].includes(result.dataCompleteness)) {
+        stage = "refund_usage";
         await usageStore.refund({ uid, screenshotHash, dateKey: reservation.dateKey });
         reservation = null;
       } else {
+        stage = "confirm_usage";
         await usageStore.confirm({ uid, screenshotHash, dateKey: reservation.dateKey });
       }
 
@@ -311,17 +349,25 @@ Important rules:
 
       return res.json({ ...result, scanCount: reservation?.scanCount ?? null, dateKey: reservation?.dateKey ?? dateKeyForTimezone(new Date(), timezoneIdentifier) });
     } catch (error) {
+      const failure = errorDiagnostic(error, stage);
+      let refundFailed = false;
       if (reservation?.status === "reserved") {
-        await usageStore.refund({ uid, screenshotHash, dateKey: reservation.dateKey }).catch(() => {});
+        try {
+          await usageStore.refund({ uid, screenshotHash, dateKey: reservation.dateKey });
+        } catch {
+          refundFailed = true;
+        }
       }
       logger.error("UNIVERSAL AI ORDER SCAN ERROR", {
-        name: error?.name || "Error",
-        code: error?.code || null,
-        status: error?.status || null,
+        ...failure,
+        modelResponseStatus,
+        modelIncompleteReason,
+        refundFailed,
       });
 
       return res.status(502).json({
         error: "AI could not analyze this screenshot.",
+        code: "order_scan_failed",
       });
     }
   });
